@@ -1,5 +1,5 @@
 /* Copyright 2015 Pierre Ossman for Cendio AB
- * Copyright 2016-2019 Brian P. Hinz
+ * Copyright 2016-2026 Brian P. Hinz
  * 
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -61,20 +61,42 @@ public class DecodeManager {
         vlog.info("Creating "+cpuCount+" decoder thread(s)");
     }
 
-    freeBuffers = new ArrayDeque<MemOutStream>(cpuCount*2);
-    workQueue = new ArrayDeque<QueueEntry>(cpuCount);
+    freeBuffers = new ArrayDeque<MemOutStream>(cpuCount*4);
+    workQueue = new ArrayDeque<QueueEntry>(cpuCount*2);
     threads = new ArrayList<DecodeThread>(cpuCount);
     while (cpuCount-- > 0) {
-      // Twice as many possible entries in the queue as there
-      // are worker threads to make sure they don't stall
       try {
-      freeBuffers.addLast(new MemOutStream());
-      freeBuffers.addLast(new MemOutStream());
-
-      threads.add(new DecodeThread(this));
+        freeBuffers.addLast(new MemOutStream());
+        freeBuffers.addLast(new MemOutStream());
+        freeBuffers.addLast(new MemOutStream());
+        freeBuffers.addLast(new MemOutStream());
+        threads.add(new DecodeThread(this));
       } catch (IllegalStateException e) { }
     }
+  }
 
+  public void stop() {
+    queueMutex.lock();
+    try {
+      if (threads != null) {
+        for (DecodeThread t : threads) {
+          t.stop();
+        }
+      }
+      producerCond.signalAll();
+      consumerCond.signalAll();
+    } finally {
+      queueMutex.unlock();
+    }
+
+    // Release any resources (e.g. native zlib Inflater state) the
+    // decoders are holding onto -- they are otherwise only reachable
+    // via garbage collection/finalization, which leaks native memory
+    // in proportion to how many connections have been made.
+    for (Decoder d : decoders) {
+      if (d != null)
+        d.close();
+    }
   }
 
   public void decodeRect(Rect r, int encoding,
@@ -160,9 +182,7 @@ public class DecodeManager {
 
       workQueue.addLast(entry);
 
-      // We only put a single entry on the queue so waking a single
-      // thread is sufficient
-      consumerCond.signal();
+      consumerCond.signalAll();
     } finally {
       queueMutex.unlock();
     }
@@ -173,9 +193,9 @@ public class DecodeManager {
     queueMutex.lock();
 
     try {
-      while (!workQueue.isEmpty())
+      while (!workQueue.isEmpty() && threadException == null)
         try {
-        producerCond.await();
+          producerCond.await();
         } catch (InterruptedException e) { }
     } finally {
       queueMutex.unlock();
@@ -184,17 +204,20 @@ public class DecodeManager {
     throwThreadException();
   }
 
-  private void setThreadException(Exception e)
+  private void setThreadException(Throwable e)
   {
-    //os::AutoMutex a(queueMutex);
     queueMutex.lock();
 
     try {
       if (threadException != null)
         return;
 
+      String msg = e.getMessage();
+      if (msg == null)
+        msg = e.getClass().getName();
       threadException =
-        new Exception("Exception on worker thread: "+e.getMessage());
+        new Exception("Exception on worker thread: "+msg);
+      producerCond.signalAll();
     } finally {
       queueMutex.unlock();
     }
@@ -290,10 +313,8 @@ public class DecodeManager {
           entry.decoder.decodeRect(entry.rect, entry.bufferStream.data(),
                                    entry.bufferStream.length(),
                                    entry.server, entry.pb);
-        } catch (com.tigervnc.rdr.Exception e) {
+        } catch (Throwable e) {
           manager.setThreadException(e);
-        } catch(java.lang.Exception e) {
-          assert(false);
         }
 
         manager.queueMutex.lock();

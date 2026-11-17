@@ -28,6 +28,7 @@
 
 namespace network { class Socket; }
 
+class AudioOutput;
 class DesktopWindow;
 
 class CConn : public rfb::CConnection
@@ -53,8 +54,7 @@ protected:
 
   // CConnection callback methods
 
-  void getUserPasswd(bool secure, std::string *user,
-                     std::string *password) override;
+  void getUserPasswd(std::string *user, std::string *password) override;
   bool verifyCertificate(unsigned int status,
                          const uint8_t* certificate,
                          size_t length) override;
@@ -85,6 +85,10 @@ protected:
   void handleClipboardAnnounce(bool available) override;
   void handleClipboardData(const char* data) override;
 
+  void handleAudioBegin() override;
+  void handleAudioEnd() override;
+  void handleAudioData(const uint8_t* data, size_t length) override;
+
 private:
 
   void resizeFramebuffer() override;
@@ -106,10 +110,10 @@ private:
 
   DesktopWindow *desktop;
 
+  AudioOutput *audioOutput;
+
   unsigned updateCount;
   unsigned pixelCount;
-
-  rfb::PixelFormat fullColourPF;
 
   int lastServerEncoding;
 

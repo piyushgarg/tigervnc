@@ -21,8 +21,11 @@
 #include <config.h>
 #endif
 
+#include <algorithm>
+
 #include <core/Configuration.h>
 #include <core/LogWriter.h>
+#include <core/i18n.h>
 
 #include <rdr/OutStream.h>
 #include <rfb/encodings.h>
@@ -36,7 +39,7 @@ using namespace rfb;
 static core::LogWriter vlog("ZRLEEncoder");
 
 core::IntParameter zlibLevel("ZlibLevel",
-                             "[DEPRECATED] Zlib compression level",
+                             _("[DEPRECATED] Zlib compression level"),
                              -1, -1, -1);
 
 ZRLEEncoder::ZRLEEncoder(SConnection* conn_)
@@ -44,9 +47,9 @@ ZRLEEncoder::ZRLEEncoder(SConnection* conn_)
   zos(nullptr, 2), mos(129*1024)
 {
   if (zlibLevel != -1) {
-    vlog.info("Warning: The ZlibLevel option is deprecated and is "
-              "ignored by the server. The compression level can be set "
-              "by the client instead.");
+    vlog.info(_("Warning: The ZlibLevel option is deprecated and is "
+                "ignored by the server. The compression level can be "
+                "set by the client instead."));
   }
   zos.setUnderlying(&mos);
 }
@@ -249,12 +252,20 @@ void ZRLEEncoder::writePixels(const uint8_t* buffer, const PixelFormat& pf,
     return;
   }
 
-  if (pixBuf[0] == 0)
-    buffer++;
-
-  while (count--) {
-    zos.writeBytes(buffer, 3);
-    buffer += 4;
+  // Batch 24-bit output instead of making a three-byte write for each pixel.
+  uint8_t packed[256 * 3];
+  const unsigned int skip = pixBuf[0] == 0 ? 1 : 0;
+  while (count > 0) {
+    const unsigned int pixels = std::min(count, 256u);
+    for (unsigned int i = 0; i < pixels; i++) {
+      const uint8_t* pixel = buffer + i * 4 + skip;
+      packed[i * 3] = pixel[0];
+      packed[i * 3 + 1] = pixel[1];
+      packed[i * 3 + 2] = pixel[2];
+    }
+    zos.writeBytes(packed, pixels * 3);
+    buffer += pixels * 4;
+    count -= pixels;
   }
 }
 

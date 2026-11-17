@@ -28,8 +28,9 @@
 #include <rfb_win32/RegConfig.h>
 #include <rfb_win32/SDisplay.h>
 #include <rfb_win32/SocketManager.h>
-#include <winvnc/QueryConnectDialog.h>
-#include <winvnc/ManagedListener.h>
+
+#include "QueryConnectDialog.h"
+#include "ManagedListener.h"
 
 namespace core {
     class Thread;
@@ -82,8 +83,7 @@ namespace winvnc {
     // QueryConnectionHandler interface
     // Callback used to prompt user to accept or reject a connection.
     // CALLBACK IN VNCServerST "HOST" THREAD
-    void queryConnection(network::Socket* sock,
-                         const char* userName) override;
+    void queryConnection(rfb::SConnection* conn) override;
 
     // SocketManager::AddressChangeNotifier interface
     // Used to keep tray icon up to date

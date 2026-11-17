@@ -34,8 +34,10 @@
 #include <nettle/bignum.h>
 #include <nettle/sha1.h>
 #include <nettle/sha2.h>
+#include <nettle/version.h>
 
 #include <core/LogWriter.h>
+#include <core/i18n.h>
 #include <core/string.h>
 
 #include <rfb/CSecurityRSAAES.h>
@@ -86,10 +88,12 @@ void CSecurityRSAAES::cleanup()
         raos->cork(false);
         raos->flush();
         if (raos->hasBufferedData())
-          vlog.error("Failed to flush remaining socket data on close");
+          vlog.error(_("Failed to flush remaining socket data "
+                       "on close"));
       }
     } catch (std::exception& e) {
-      vlog.error("Failed to flush remaining socket data on close: %s", e.what());
+      vlog.error(_("Failed to flush remaining socket data "
+                   "on close: %s"), e.what());
     }
   }
 
@@ -155,7 +159,7 @@ static void random_func(void*, size_t length, uint8_t* dst)
 {
   rdr::RandomStream rs;
   if (!rs.hasData(length))
-    throw std::runtime_error("Failed to generate random");
+    throw std::runtime_error(_("Failed to generate random data"));
   rs.readBytes(dst, length);
 }
 
@@ -176,7 +180,7 @@ void CSecurityRSAAES::writePublicKey()
   if (!rsa_generate_keypair(&clientPublicKey, &clientKey,
                             nullptr, random_func, nullptr, nullptr,
                             clientKeyLength, 0))
-    throw std::runtime_error("Failed to generate key");
+    throw std::runtime_error(_("Failed to generate encryption key"));
   clientKeyN = new uint8_t[rsaKeySize];
   clientKeyE = new uint8_t[rsaKeySize];
   nettle_mpz_get_str_256(rsaKeySize, clientKeyN, clientPublicKey.n);
@@ -195,9 +199,9 @@ bool CSecurityRSAAES::readPublicKey()
   is->setRestorePoint();
   serverKeyLength = is->readU32();
   if (serverKeyLength < MinKeyLength)
-    throw protocol_error("Server key is too short");
+    throw protocol_error(_("Server encryption key is too short"));
   if (serverKeyLength > MaxKeyLength)
-    throw protocol_error("Server key is too long");
+    throw protocol_error(_("Server encryption key is too long"));
   size_t size = (serverKeyLength + 7) / 8;
   if (!is->hasDataOrRestore(size * 2))
     return false;
@@ -210,7 +214,7 @@ bool CSecurityRSAAES::readPublicKey()
   nettle_mpz_set_str_256_u(serverKey.n, size, serverKeyN);
   nettle_mpz_set_str_256_u(serverKey.e, size, serverKeyE);
   if (!rsa_public_key_prepare(&serverKey))
-    throw protocol_error("Server key is invalid");
+    throw protocol_error(_("Server encryption key is invalid"));
   return true;
 }
 
@@ -218,7 +222,7 @@ void CSecurityRSAAES::verifyServer()
 {
   rdr::MemOutStream key(4 + serverKey.size * 2);
 
-  uint8_t f[8];
+  uint8_t f[SHA1_DIGEST_SIZE];
   struct sha1_ctx ctx;
   std::string fingerprint;
 
@@ -228,7 +232,11 @@ void CSecurityRSAAES::verifyServer()
 
   sha1_init(&ctx);
   sha1_update(&ctx, key.length(), key.data());
-  sha1_digest(&ctx, sizeof(f), f);
+#if NETTLE_VERSION_MAJOR >= 4
+  sha1_digest(&ctx, f);
+#else
+  sha1_digest(&ctx, SHA1_DIGEST_SIZE, f);
+#endif
 
   // This is the format used by RealVNC, so use the same so users can
   // compare
@@ -245,7 +253,7 @@ void CSecurityRSAAES::writeRandom()
   rdr::RandomStream rs;
   rdr::OutStream* os = cc->getOutStream();
   if (!rs.hasData(keySize / 8))
-    throw std::runtime_error("Failed to generate random");
+    throw std::runtime_error(_("Failed to generate random data"));
   rs.readBytes(clientRandom, keySize / 8);
   mpz_t x;
   mpz_init(x);
@@ -259,7 +267,7 @@ void CSecurityRSAAES::writeRandom()
   }
   if (!res) {
     mpz_clear(x);
-    throw std::runtime_error("Failed to encrypt random");
+    throw std::runtime_error(_("Failed to encrypt data"));
   }
   uint8_t* buffer = new uint8_t[serverKey.size];
   nettle_mpz_get_str_256(serverKey.size, buffer, x);
@@ -278,7 +286,8 @@ bool CSecurityRSAAES::readRandom()
   is->setRestorePoint();
   size_t size = is->readU16();
   if (size != clientKey.size)
-    throw protocol_error("Client key length doesn't match");
+    throw protocol_error(
+      _("Client key length doesn't match length of random data"));
   if (!is->hasDataOrRestore(size))
     return false;
   is->clearRestorePoint();
@@ -291,7 +300,7 @@ bool CSecurityRSAAES::readRandom()
   if (!rsa_decrypt(&clientKey, &randomSize, serverRandom, x) ||
       randomSize != (size_t)keySize / 8) {
     mpz_clear(x);
-    throw protocol_error("Failed to decrypt server random");
+    throw protocol_error(_("Failed to decrypt data"));
   }
   mpz_clear(x);
   return true;
@@ -301,30 +310,47 @@ void CSecurityRSAAES::setCipher()
 {
   rawis = cc->getInStream();
   rawos = cc->getOutStream();
-  uint8_t key[32];
+  uint8_t key[SHA256_DIGEST_SIZE];
+  memset(key, 0, sizeof(key));
   if (keySize == 128) {
     struct sha1_ctx ctx;
     sha1_init(&ctx);
     sha1_update(&ctx, 16, clientRandom);
     sha1_update(&ctx, 16, serverRandom);
-    sha1_digest(&ctx, 16, key);
+#if NETTLE_VERSION_MAJOR >= 4
+    sha1_digest(&ctx, key);
+#else
+    sha1_digest(&ctx, SHA1_DIGEST_SIZE, key);
+#endif
     rais = new rdr::AESInStream(rawis, key, 128);
     sha1_init(&ctx);
     sha1_update(&ctx, 16, serverRandom);
     sha1_update(&ctx, 16, clientRandom);
-    sha1_digest(&ctx, 16, key);
+#if NETTLE_VERSION_MAJOR >= 4
+    sha1_digest(&ctx, key);
+#else
+    sha1_digest(&ctx, SHA1_DIGEST_SIZE, key);
+#endif
     raos = new rdr::AESOutStream(rawos, key, 128);
   } else {
     struct sha256_ctx ctx;
     sha256_init(&ctx);
     sha256_update(&ctx, 32, clientRandom);
     sha256_update(&ctx, 32, serverRandom);
-    sha256_digest(&ctx, 32, key);
+#if NETTLE_VERSION_MAJOR >= 4
+    sha256_digest(&ctx, key);
+#else
+    sha256_digest(&ctx, SHA256_DIGEST_SIZE, key);
+#endif
     rais = new rdr::AESInStream(rawis, key, 256);
     sha256_init(&ctx);
     sha256_update(&ctx, 32, serverRandom);
     sha256_update(&ctx, 32, clientRandom);
-    sha256_digest(&ctx, 32, key);
+#if NETTLE_VERSION_MAJOR >= 4
+    sha256_digest(&ctx, key);
+#else
+    sha256_digest(&ctx, SHA256_DIGEST_SIZE, key);
+#endif
     raos = new rdr::AESOutStream(rawos, key, 256);
   }
   if (isAllEncrypted)
@@ -333,7 +359,8 @@ void CSecurityRSAAES::setCipher()
 
 void CSecurityRSAAES::writeHash()
 {
-  uint8_t hash[32];
+  uint8_t hash[SHA256_DIGEST_SIZE];
+  memset(hash, 0, sizeof(hash));
   size_t len = serverKeyLength;
   uint8_t lenServerKey[4] = {
     (uint8_t)((len & 0xff000000) >> 24),
@@ -350,7 +377,7 @@ void CSecurityRSAAES::writeHash()
   };
   int hashSize;
   if (keySize == 128) {
-    hashSize = 20;
+    hashSize = SHA1_DIGEST_SIZE;
     struct sha1_ctx ctx;
     sha1_init(&ctx);
     sha1_update(&ctx, 4, lenClientKey);
@@ -359,9 +386,13 @@ void CSecurityRSAAES::writeHash()
     sha1_update(&ctx, 4, lenServerKey);
     sha1_update(&ctx, serverKey.size, serverKeyN);
     sha1_update(&ctx, serverKey.size, serverKeyE);
+#if NETTLE_VERSION_MAJOR >= 4
+    sha1_digest(&ctx, hash);
+#else
     sha1_digest(&ctx, hashSize, hash);
+#endif
   } else {
-    hashSize = 32;
+    hashSize = SHA256_DIGEST_SIZE;
     struct sha256_ctx ctx;
     sha256_init(&ctx);
     sha256_update(&ctx, 4, lenClientKey);
@@ -370,7 +401,11 @@ void CSecurityRSAAES::writeHash()
     sha256_update(&ctx, 4, lenServerKey);
     sha256_update(&ctx, serverKey.size, serverKeyN);
     sha256_update(&ctx, serverKey.size, serverKeyE);
+#if NETTLE_VERSION_MAJOR >= 4
+    sha256_digest(&ctx, hash);
+#else
     sha256_digest(&ctx, hashSize, hash);
+#endif
   }
   raos->writeBytes(hash, hashSize);
   raos->flush();
@@ -378,9 +413,17 @@ void CSecurityRSAAES::writeHash()
 
 bool CSecurityRSAAES::readHash()
 {
-  uint8_t hash[32];
-  uint8_t realHash[32];
-  int hashSize = keySize == 128 ? 20 : 32;
+  uint8_t hash[SHA256_DIGEST_SIZE];
+  uint8_t realHash[SHA256_DIGEST_SIZE];
+  memset(hash, 0, sizeof(hash));
+  memset(realHash, 0, sizeof(realHash));
+  int hashSize;
+  if (keySize == 128) {
+    hashSize = SHA1_DIGEST_SIZE;
+  } else {
+    hashSize = SHA256_DIGEST_SIZE;
+  }
+
   if (!rais->hasData(hashSize))
     return false;
   rais->readBytes(hash, hashSize);
@@ -407,7 +450,11 @@ bool CSecurityRSAAES::readHash()
     sha1_update(&ctx, 4, lenClientKey);
     sha1_update(&ctx, clientKey.size, clientKeyN);
     sha1_update(&ctx, clientKey.size, clientKeyE);
+#if NETTLE_VERSION_MAJOR >= 4
+    sha1_digest(&ctx, realHash);
+#else
     sha1_digest(&ctx, hashSize, realHash);
+#endif
   } else {
     struct sha256_ctx ctx;
     sha256_init(&ctx);
@@ -417,10 +464,14 @@ bool CSecurityRSAAES::readHash()
     sha256_update(&ctx, 4, lenClientKey);
     sha256_update(&ctx, clientKey.size, clientKeyN);
     sha256_update(&ctx, clientKey.size, clientKeyE);
+#if NETTLE_VERSION_MAJOR >= 4
+    sha256_digest(&ctx, realHash);
+#else
     sha256_digest(&ctx, hashSize, realHash);
+#endif
   }
   if (memcmp(hash, realHash, hashSize) != 0)
-    throw protocol_error("Hash doesn't match");
+    throw protocol_error(_("Incorrect hash received"));
   return true;
 }
 
@@ -450,7 +501,7 @@ bool CSecurityRSAAES::readSubtype()
     return false;
   subtype = rais->readU8();
   if (subtype != secTypeRA2UserPass && subtype != secTypeRA2Pass)
-    throw protocol_error("Unknown RSA-AES subtype");
+    throw protocol_error(_("Unknown RSA-AES subtype"));
   return true;
 }
 
@@ -460,13 +511,13 @@ void CSecurityRSAAES::writeCredentials()
   std::string password;
 
   if (subtype == secTypeRA2UserPass)
-    cc->getUserPasswd(isSecure(), &username, &password);
+    cc->getUserPasswd(&username, &password);
   else
-    cc->getUserPasswd(isSecure(), nullptr, &password);
+    cc->getUserPasswd(nullptr, &password);
 
   if (subtype == secTypeRA2UserPass) {
     if (username.size() > 255)
-      throw std::out_of_range("Username is too long");
+      throw std::length_error("Username is too long");
     raos->writeU8(username.size());
     raos->writeBytes((const uint8_t*)username.data(), username.size());
   } else {
@@ -474,7 +525,7 @@ void CSecurityRSAAES::writeCredentials()
   }
 
   if (password.size() > 255)
-    throw std::out_of_range("Password is too long");
+    throw std::length_error("Password is too long");
   raos->writeU8(password.size());
   raos->writeBytes((const uint8_t*)password.data(), password.size());
   raos->flush();

@@ -121,15 +121,27 @@ public class FdInStream extends InStream {
 
   protected int overrun(int itemSize, int nItems, boolean wait)
   {
-    if (itemSize > bufSize)
-      throw new Exception("FdInStream overrun: max itemSize exceeded");
+    if (itemSize > InStream.maxBufSize)
+      throw new Exception("FdInStream overrun: requested size of " +
+                          itemSize + " exceeds maximum of " +
+                          InStream.maxBufSize);
 
-    if (end - ptr != 0)
+    if (end > ptr)
       System.arraycopy(b, ptr, b, 0, end - ptr);
 
     offset += ptr;
-    end -= ptr;
+    end = Math.max(0, end - ptr);
     ptr = 0;
+
+    if (itemSize > bufSize) {
+      int newSize = bufSize;
+      while (newSize < itemSize)
+        newSize *= 2;
+      byte[] newBuf = new byte[newSize];
+      System.arraycopy(b, 0, newBuf, 0, end);
+      b = newBuf;
+      bufSize = newSize;
+    }
 
     int bytes_to_read;
     while (end < itemSize) {
@@ -168,9 +180,9 @@ public class FdInStream extends InStream {
         Integer tv;
 
         if (!wait) {
-          tv = new Integer(0);
+          tv = Integer.valueOf(0);
         } else if (timeoutms != -1) {
-          tv = new Integer(timeoutms);
+          tv = Integer.valueOf(timeoutms);
         } else {
           tv = null;
         }
@@ -196,7 +208,8 @@ public class FdInStream extends InStream {
       throw new SystemException("read:"+e.toString());
     }
 
-    if (n == 0) throw new EndOfStream();
+    if (n < 0) throw new EndOfStream();
+    if (n == 0) return 0;
 
     if (timing) {
       long after = System.nanoTime();

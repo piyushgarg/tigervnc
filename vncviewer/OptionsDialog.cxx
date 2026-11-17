@@ -24,6 +24,8 @@
 #include <stdlib.h>
 #include <list>
 
+#include <core/Configuration.h>
+#include <core/i18n.h>
 #include <core/string.h>
 
 #include <rfb/encodings.h>
@@ -37,9 +39,9 @@
 #endif
 #endif
 
+#include "MonitorIndicesParameter.h"
 #include "OptionsDialog.h"
 #include "ShortcutHandler.h"
-#include "i18n.h"
 #include "parameters.h"
 
 #include "fltk/layout.h"
@@ -360,6 +362,9 @@ void OptionsDialog::loadOptions(void)
   /* Misc. */
   sharedCheckbox->value(shared);
   reconnectCheckbox->value(reconnectOnError);
+#ifdef HAVE_AUDIO
+  audioCheckbox->value(playAudio);
+#endif
   alwaysCursorCheckbox->value(alwaysCursor);
   if (cursorType == "system") {
     cursorTypeChoice->value(1);
@@ -515,6 +520,9 @@ void OptionsDialog::storeOptions(void)
   /* Misc. */
   shared.setParam(sharedCheckbox->value());
   reconnectOnError.setParam(reconnectCheckbox->value());
+#ifdef HAVE_AUDIO
+  playAudio.setParam(audioCheckbox->value());
+#endif
   alwaysCursor.setParam(alwaysCursorCheckbox->value());
 
   if (cursorTypeChoice->value() == 1) {
@@ -1045,7 +1053,7 @@ void OptionsDialog::createShortcutsPage(int tx, int ty, int tw, int th)
   tx += OUTER_MARGIN;
   ty += OUTER_MARGIN;
 
-  Fl_Box *intro = new Fl_Box(tx, ty, tw - OUTER_MARGIN * 2, INPUT_HEIGHT);
+  Fl_Box *intro = fltk_box(tx, ty, tw - OUTER_MARGIN * 2, INPUT_HEIGHT);
   intro->align(FL_ALIGN_TOP_LEFT|FL_ALIGN_INSIDE);
   intro->label(_("Modifier keys for keyboard shortcuts:"));
 
@@ -1101,7 +1109,7 @@ void OptionsDialog::createShortcutsPage(int tx, int ty, int tw, int th)
 
   ty += BUTTON_HEIGHT + INNER_MARGIN;
 
-  shortcutsText = new Fl_Box(tx, ty, tw - OUTER_MARGIN * 2, th - ty - OUTER_MARGIN);
+  shortcutsText = fltk_box(tx, ty, tw - OUTER_MARGIN * 2, th - ty - OUTER_MARGIN);
   shortcutsText->align(FL_ALIGN_TOP_LEFT|FL_ALIGN_INSIDE|FL_ALIGN_WRAP);
 
   group->end();
@@ -1210,7 +1218,7 @@ void OptionsDialog::createDisplayPage(int tx, int ty, int tw, int th)
       w = width;
       fl_measure(label, w, h);
 
-      box = new Fl_Box(tx, ty, w, h, label);
+      box = fltk_box(tx, ty, w, h, label);
       box->align(FL_ALIGN_TOP_LEFT | FL_ALIGN_INSIDE | FL_ALIGN_WRAP);
       ty += h + INNER_MARGIN;
     }
@@ -1251,6 +1259,14 @@ void OptionsDialog::createMiscPage(int tx, int ty, int tw, int th)
                                                   _("Ask to reconnect on connection errors")));
   ty += CHECK_HEIGHT + TIGHT_MARGIN;
 
+#ifdef HAVE_AUDIO
+  audioCheckbox = new Fl_Check_Button(LBLRIGHT(tx, ty,
+                                               CHECK_MIN_WIDTH,
+                                               CHECK_HEIGHT,
+                                               _("Play audio from the server")));
+  ty += CHECK_HEIGHT + TIGHT_MARGIN;
+#endif
+
   group->end();
 }
 
@@ -1284,6 +1300,7 @@ void OptionsDialog::handleCompression(Fl_Widget* /*widget*/, void *data)
 
 void OptionsDialog::handleX509(Fl_Widget* /*widget*/, void *data)
 {
+#ifdef HAVE_GNUTLS
   OptionsDialog *dialog = (OptionsDialog*)data;
 
   if (dialog->encX509Checkbox->value()) {
@@ -1293,17 +1310,24 @@ void OptionsDialog::handleX509(Fl_Widget* /*widget*/, void *data)
     dialog->caInput->deactivate();
     dialog->crlInput->deactivate();
   }
+#else
+  (void)data;
+#endif
 }
 
 
 void OptionsDialog::handleRSAAES(Fl_Widget* /*widget*/, void *data)
 {
+#ifdef HAVE_NETTLE
   OptionsDialog *dialog = (OptionsDialog*)data;
 
   if (dialog->encRSAAESCheckbox->value()) {
     dialog->authVncCheckbox->value(true);
     dialog->authPlainCheckbox->value(true);
   }
+#else
+  (void)data;
+#endif
 }
 
 

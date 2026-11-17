@@ -29,31 +29,31 @@
 #include <wmcodecdsp.h>
 #define SAFE_RELEASE(obj) if (obj) { obj->Release(); obj = nullptr; }
 
+#include <core/i18n.h>
+
 #include <rfb/PixelBuffer.h>
 #include <rfb/H264WinDecoderContext.h>
 
 using namespace rfb;
 
-// Older MinGW lacks this definition
-#ifndef HAVE_VIDEO_PROCESSOR_MFT
-static GUID CLSID_VideoProcessorMFT = { 0x88753b26, 0x5b24, 0x49bd, { 0xb2, 0xe7, 0xc, 0x44, 0x5c, 0x78, 0xc9, 0x82 } };
-#endif
+// Not declared by all toolchains and Windows versions
+static const GUID videoProcessorMFT = { 0x88753b26, 0x5b24, 0x49bd, { 0xb2, 0xe7, 0xc, 0x44, 0x5c, 0x78, 0xc9, 0x82 } };
 
 H264WinDecoderContext::H264WinDecoderContext(const core::Rect &r)
   : H264DecoderContext(r)
 {
   if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE)))
-    throw std::runtime_error("Could not initialize MediaFoundation");
+    throw std::runtime_error(_("Could not initialize MediaFoundation"));
 
   if (FAILED(CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_IMFTransform, (LPVOID*)&decoder)))
-    throw std::runtime_error("MediaFoundation H264 codec not found");
+    throw std::runtime_error(_("Could not find video codec"));
 
-  if (FAILED(CoCreateInstance(CLSID_VideoProcessorMFT, nullptr, CLSCTX_INPROC_SERVER, IID_IMFTransform, (LPVOID*)&converter)))
+  if (FAILED(CoCreateInstance(videoProcessorMFT, nullptr, CLSCTX_INPROC_SERVER, IID_IMFTransform, (LPVOID*)&converter)))
   {
     if (FAILED(CoCreateInstance(CLSID_CColorConvertDMO, nullptr, CLSCTX_INPROC_SERVER, IID_IMFTransform, (LPVOID*)&converter)))
     {
       decoder->Release();
-      throw std::runtime_error("MediaFoundation H264 codec not found");
+      throw std::runtime_error(_("Could not find video codec"));
     }
   }
 
@@ -72,7 +72,7 @@ H264WinDecoderContext::H264WinDecoderContext(const core::Rect &r)
   {
     decoder->Release();
     converter->Release();
-    throw std::runtime_error("Could not create MF MediaType");
+    throw std::bad_alloc();
   }
   input_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
   input_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
@@ -99,7 +99,7 @@ H264WinDecoderContext::H264WinDecoderContext(const core::Rect &r)
     decoder->Release();
     converter->Release();
     input_type->Release();
-    throw std::runtime_error("Could not start H264 decoder");
+    throw std::runtime_error(_("Could not start video decoder"));
   }
 
   MFT_OUTPUT_STREAM_INFO info;
@@ -119,7 +119,7 @@ H264WinDecoderContext::H264WinDecoderContext(const core::Rect &r)
     SAFE_RELEASE(converted_sample);
     SAFE_RELEASE(input_buffer);
     SAFE_RELEASE(decoded_buffer);
-    throw std::runtime_error("Could not allocate media samples/buffers");
+    throw std::bad_alloc();
   }
 
   input_sample->AddBuffer(input_buffer);
@@ -145,7 +145,7 @@ void H264WinDecoderContext::decode(const uint8_t* h264_buffer,
   {
     input_buffer->Release();
     if (FAILED(MFCreateMemoryBuffer(len, &input_buffer)))
-      throw std::runtime_error("Could not allocate media buffer");
+      throw std::bad_alloc();
     input_buffer->SetCurrentLength(len);
     input_sample->RemoveAllBuffers();
     input_sample->AddBuffer(input_buffer);
@@ -272,6 +272,9 @@ void H264WinDecoderContext::decode(const uint8_t* h264_buffer,
         MFT_OUTPUT_STREAM_INFO info;
         converter->GetOutputStreamInfo(0, &info);
 
+        // Replace, not add, in case this is not the first stream change
+        converted_sample->RemoveAllBuffers();
+        SAFE_RELEASE(converted_buffer)
         if (FAILED(MFCreateMemoryBuffer(info.cbSize, &converted_buffer)))
         {
           // Silently ignore errors, hoping its a temporary encoding glitch
@@ -282,6 +285,33 @@ void H264WinDecoderContext::decode(const uint8_t* h264_buffer,
         }
       }
       output_type->Release();
+
+      // The constructor sized decoded_buffer from the output stream info
+      // before any input had been seen, when the decoder's output type
+      // still had its default 1920x1080 frame size. A larger stream needs
+      // a larger buffer, or every ProcessOutput() fails.
+      MFT_OUTPUT_STREAM_INFO decoder_info;
+      if (SUCCEEDED(decoder->GetOutputStreamInfo(0, &decoder_info)))
+      {
+        DWORD maxlen = 0;
+        decoded_buffer->GetMaxLength(&maxlen);
+        if (decoder_info.cbSize > maxlen)
+        {
+          IMFMediaBuffer* buffer;
+          if (SUCCEEDED(MFCreateMemoryBuffer(decoder_info.cbSize, &buffer)))
+          {
+            decoded_sample->RemoveAllBuffers();
+            decoded_buffer->Release();
+            decoded_buffer = buffer;
+            decoded_sample->AddBuffer(decoded_buffer);
+          }
+        }
+      }
+    }
+    else
+    {
+      // Retrying won't help, and would loop forever
+      break;
     }
   }
 
@@ -308,15 +338,20 @@ void H264WinDecoderContext::decode(const uint8_t* h264_buffer,
     if (FAILED(hr))
     {
       // Silently ignore errors, hoping its a temporary encoding glitch
+      return;
     }
-    else
-    {
-      BYTE* out;
-      DWORD buflen;
-      converted_buffer->Lock(&out, nullptr, &buflen);
-      pb->imageRect(rect, out + offset_y * stride + offset_x * 4, (int)stride / 4);
-      converted_buffer->Unlock();
-    }
+
+    if ((offset_x >= full_width) || (offset_y >= full_height))
+      return;
+    if (((full_width - offset_x) < (uint32_t)rect.width()) ||
+        ((full_height - offset_y) < (uint32_t)rect.height()))
+      return;
+
+    BYTE* out;
+    DWORD buflen;
+    converted_buffer->Lock(&out, nullptr, &buflen);
+    pb->imageRect(rect, out + offset_y * stride + offset_x * 4, (int)stride / 4);
+    converted_buffer->Unlock();
   }
 }
 
@@ -359,11 +394,13 @@ void H264WinDecoderContext::ParseSPS(const uint8_t* buffer, int length)
 #define SKIP_UE() do { \
     unsigned var;      \
     GET_UE(var);       \
+    (void)var;         \
 } while (0)
 
 #define SKIP_BITS(bits) do { \
     unsigned var;            \
     GET_BITS(bits, var);     \
+    (void)var;               \
 } while (0)
 
     // check for NAL header
@@ -384,13 +421,12 @@ void H264WinDecoderContext::ParseSPS(const uint8_t* buffer, int length)
     uint8_t byte_ = 0;
 
     unsigned profile_idc;
-    unsigned seq_parameter_set_id;
 
     GET_BITS(8, profile_idc);
     SKIP_BITS(6); // constraint_set0..5_flag
     SKIP_BITS(2); // reserved_zero_2bits
     SKIP_BITS(8); // level_idc
-    GET_UE(seq_parameter_set_id);
+    SKIP_UE(); // seq_parameter_set_id
 
     unsigned chroma_format_idc = 1;
     if (profile_idc == 100 || profile_idc == 110 ||
@@ -425,8 +461,7 @@ void H264WinDecoderContext::ParseSPS(const uint8_t* buffer, int length)
         }
     }
 
-    unsigned log2_max_frame_num_minus4;
-    GET_UE(log2_max_frame_num_minus4); // log2_max_frame_num_minus4
+    SKIP_UE(); // log2_max_frame_num_minus4
     unsigned pic_order_cnt_type;
     GET_UE(pic_order_cnt_type);
     if (pic_order_cnt_type == 0)

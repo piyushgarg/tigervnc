@@ -1,3 +1,7 @@
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  message(FATAL_ERROR "cmake must be invoked with the top level directory")
+endif()
+
 add_library(rfb_win32 STATIC
   AboutDialog.cxx
   Clipboard.cxx
@@ -34,4 +38,7 @@ if(BUILD_WINVNC)
   target_sources(rfb_win32 PRIVATE ${RFB_WIN32_SOURCES} CleanDesktop.cxx)
 endif()
 
-target_link_libraries(rfb_win32 user32.lib comctl32.lib wtsapi32.lib version.lib)
+target_include_directories(rfb_win32 PUBLIC ${CMAKE_SOURCE_DIR}/win)
+
+target_link_libraries(rfb_win32 PRIVATE rfbserver rfb network rdr core)
+target_link_libraries(rfb_win32 PRIVATE user32.lib comctl32.lib wtsapi32.lib version.lib)

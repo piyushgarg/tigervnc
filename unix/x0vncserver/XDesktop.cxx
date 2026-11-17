@@ -29,12 +29,12 @@
 #include <algorithm>
 
 #include <core/LogWriter.h>
+#include <core/i18n.h>
 
 #include <network/Socket.h>
 
+#include <rfb/SConnection.h>
 #include <rfb/ScreenSet.h>
-
-#include <x0vncserver/XDesktop.h>
 
 #include <X11/XKBlib.h>
 #include <X11/Xutil.h>
@@ -55,8 +55,10 @@ extern "C" {
 void vncSetGlueContext(Display *dpy, void *res);
 }
 #endif
-#include <x0vncserver/Geometry.h>
-#include <x0vncserver/XPixelBuffer.h>
+
+#include "Geometry.h"
+#include "XDesktop.h"
+#include "XPixelBuffer.h"
 
 extern const unsigned short code_map_qnum_to_xorgevdev[];
 extern const unsigned int code_map_qnum_to_xorgevdev_len;
@@ -65,17 +67,17 @@ extern const unsigned short code_map_qnum_to_xorgkbd[];
 extern const unsigned int code_map_qnum_to_xorgkbd_len;
 
 core::BoolParameter
-  useShm("UseSHM", "Use MIT-SHM extension if available", true);
+  useShm("UseSHM", _("Use MIT-SHM extension if available"), true);
 core::BoolParameter
   rawKeyboard("RawKeyboard",
-              "Send keyboard events straight through and avoid "
-              "mapping them to the current keyboard layout",
+              _("Send keyboard events straight through and avoid "
+                "mapping them to the current keyboard layout"),
               false);
 core::IntParameter
   queryConnectTimeout("QueryConnectTimeout",
-                      "Number of seconds to show the 'Accept "
-                      "connection' dialog before rejecting the "
-                      "connection",
+                      _("Number of seconds to show the 'Accept "
+                        "connection' dialog before rejecting the "
+                        "connection"),
                       10, 0, INT_MAX);
 
 static core::LogWriter vlog("XDesktop");
@@ -87,7 +89,7 @@ static const char * ledNames[XDESKTOP_N_LEDS] = {
 
 XDesktop::XDesktop(Display* dpy_, Geometry *geometry_)
   : dpy(dpy_), geometry(geometry_), pb(nullptr), server(nullptr),
-    queryConnectDialog(nullptr), queryConnectSock(nullptr), selection(dpy_, this),
+    queryConnectDialog(nullptr), pendingQuery(nullptr), selection(dpy_, this),
     oldButtonMask(0), haveXtest(false), haveDamage(false),
     maxButtons(0), running(false), ledMasks(), ledState(0),
     codeMap(nullptr), codeMapLen(0)
@@ -100,8 +102,8 @@ XDesktop::XDesktop(Display* dpy_, Geometry *geometry_)
   minor = XkbMinorVersion;
   if (!XkbQueryExtension(dpy, &xkbOpcode, &xkbEventBase,
                          &xkbErrorBase, &major, &minor)) {
-    vlog.error("XKEYBOARD extension not present");
-    throw std::runtime_error("XKEYBOARD extension not present");
+    vlog.error(_("XKEYBOARD extension not present"));
+    throw std::runtime_error(_("XKEYBOARD extension not present"));
   }
 
   XkbSelectEvents(dpy, XkbUseCoreKbd, XkbIndicatorStateNotifyMask,
@@ -133,13 +135,13 @@ XDesktop::XDesktop(Display* dpy_, Geometry *geometry_)
       if (strncmp("evdev", keycodes, strlen("evdev")) == 0) {
         codeMap = code_map_qnum_to_xorgevdev;
         codeMapLen = code_map_qnum_to_xorgevdev_len;
-        vlog.info("Using evdev codemap\n");
+        vlog.info(_("Using %s codemap"), "evdev");
       } else if (strncmp("xfree86", keycodes, strlen("xfree86")) == 0) {
         codeMap = code_map_qnum_to_xorgkbd;
         codeMapLen = code_map_qnum_to_xorgkbd_len;
-        vlog.info("Using xorgkbd codemap\n");
+        vlog.info(_("Using %s codemap"), "xorgkbd");
       } else {
-        vlog.info("Unknown keycode '%s', no codemap\n", keycodes);
+        vlog.info(_("Unknown keycodes name '%s'"), keycodes);
       }
       XFree(keycodes);
     } else {
@@ -156,12 +158,12 @@ XDesktop::XDesktop(Display* dpy_, Geometry *geometry_)
   if (XTestQueryExtension(dpy, &xtestEventBase,
                           &xtestErrorBase, &major, &minor)) {
     XTestGrabControl(dpy, True);
-    vlog.info("XTest extension present - version %d.%d",major,minor);
+    vlog.debug("XTest extension present - version %d.%d",major,minor);
     haveXtest = true;
   } else {
 #endif
-    vlog.info("XTest extension not present");
-    vlog.info("Unable to inject events or display while server is grabbed");
+    vlog.info(_("XTest extension not present, all connections will be "
+                "view only"));
 #ifdef HAVE_XTEST
   }
 #endif
@@ -173,8 +175,8 @@ XDesktop::XDesktop(Display* dpy_, Geometry *geometry_)
     haveDamage = true;
   } else {
 #endif
-    vlog.info("DAMAGE extension not present");
-    vlog.info("Will have to poll screen for changes");
+    vlog.info(_("DAMAGE extension not present, will have to poll "
+                "the screen for changes"));
 #ifdef HAVE_XDAMAGE
   }
 #endif
@@ -192,8 +194,8 @@ XDesktop::XDesktop(Display* dpy_, Geometry *geometry_)
                                XFixesSetSelectionOwnerNotifyMask);
   } else {
 #endif
-    vlog.info("XFIXES extension not present");
-    vlog.info("Will not be able to display cursors or monitor clipboard");
+    vlog.info(_("XFIXES extension not present, will not be able to "
+                "display the cursor or monitor the clipboard"));
 #ifdef HAVE_XFIXES
   }
 #endif
@@ -211,8 +213,8 @@ XDesktop::XDesktop(Display* dpy_, Geometry *geometry_)
                  ExposureMask | EnterWindowMask | LeaveWindowMask);
   } else {
 #endif
-    vlog.info("RANDR extension not present");
-    vlog.info("Will not be able to handle session resize");
+    vlog.info(_("RANDR extension not present, will not be able to "
+                "resize the desktop"));
 #ifdef HAVE_XRANDR
   }
 #endif
@@ -254,15 +256,15 @@ void XDesktop::start()
   unsigned char btnMap[9];
   int numButtons = XGetPointerMapping(dpy, btnMap, 9);
   maxButtons = (numButtons > 9) ? 9 : numButtons;
-  vlog.info("Enabling %d button%s of X pointer device",
-            maxButtons, (maxButtons != 1) ? "s" : "");
+  vlog.debug("Enabling %d button%s of X pointer device",
+             maxButtons, (maxButtons != 1) ? "s" : "");
 
   // Create an ImageFactory instance for producing Image objects.
   ImageFactory factory((bool)useShm);
 
   // Create pixel buffer and provide it to the server object.
   pb = new XPixelBuffer(dpy, factory, geometry->getRect());
-  vlog.info("Allocated %s", pb->getImage()->classDesc());
+  vlog.debug("Allocated %s", pb->getImage()->classDesc());
 
   server->setPixelBuffer(pb, computeScreenLayout());
 
@@ -319,35 +321,41 @@ bool XDesktop::isRunning() {
   return running;
 }
 
-void XDesktop::queryConnection(network::Socket* sock,
-                               const char* userName)
+void XDesktop::queryConnection(rfb::SConnection* conn)
 {
+  const char* userName;
+
   assert(isRunning());
 
   // Someone already querying?
-  if (queryConnectSock) {
+  if (pendingQuery) {
     std::list<network::Socket*> sockets;
 
-    // Check if this socket is still valid
+    // Check if this connection is still valid
     server->getSockets(&sockets);
-    if (std::find(sockets.begin(), sockets.end(),
-                  queryConnectSock) != sockets.end()) {
-      server->approveConnection(sock, false, "Another connection is currently being queried.");
+    if (std::find_if(sockets.begin(), sockets.end(),
+                     [this](network::Socket* sock) {
+                       return server->getConnection(sock) ==
+                              pendingQuery;
+                     }) != sockets.end()) {
+      server->approveConnection(conn, false,
+                                _("Another connection is currently "
+                                  "being queried."));
       return;
     }
   }
 
-  if (!userName)
-    userName = "(anonymous)";
+  userName = conn->getUserName();
 
-  queryConnectSock = sock;
+  if (userName[0] == '\0')
+    userName = _("(anonymous)");
+
+  pendingQuery = conn;
 
   delete queryConnectDialog;
-  queryConnectDialog = new QueryConnectDialog(dpy,
-                                              sock->getPeerAddress(),
-                                              userName,
-                                              queryConnectTimeout,
-                                              this);
+  queryConnectDialog =
+    new QueryConnectDialog(dpy, conn->getSock()->getPeerAddress(),
+                           userName, queryConnectTimeout, this);
   queryConnectDialog->map();
 }
 
@@ -503,8 +511,8 @@ KeyCode XDesktop::addKeysym(KeySym keysym)
   changes.num_key_syms = 1;
 
   if (XkbChangeMap(dpy, xkb, &changes)) {
-    vlog.info("Added unknown keysym XK_%s (0x%04x) to keycode %d",
-              XKeysymToString(keysym), (unsigned)keysym, key);
+    vlog.debug("Added unknown keysym XK_%s (0x%04x) to keycode %d",
+               XKeysymToString(keysym), (unsigned)keysym, key);
     addedKeysyms.push_front({ syms[0], (KeyCode)key });
     return key;
   }
@@ -562,7 +570,8 @@ KeyCode XDesktop::keysymToKeycode(KeySym keysym) {
   keycode = addKeysym(keysym);
 
   if (keycode == 0)
-    vlog.error("Failure adding new keysym 0x%lx", keysym);
+    vlog.error(_("Failed to add new keysym XK_%s (0x%04x)"),
+               XKeysymToString(keysym), (unsigned)keysym);
 
   return keycode;
 }
@@ -589,7 +598,8 @@ void XDesktop::keyEvent(uint32_t keysym, uint32_t xtcode, bool down) {
   }
 
   if (!keycode) {
-    vlog.error("Could not map key event to X11 key code");
+    vlog.error(_("Could not map keysym XK_%s (0x%04x) to keycode"),
+               XKeysymToString(keysym), (unsigned)keysym);
     return;
   }
 
@@ -614,12 +624,11 @@ void XDesktop::keyEvent(uint32_t keysym, uint32_t xtcode, bool down) {
 rfb::ScreenSet XDesktop::computeScreenLayout()
 {
   rfb::ScreenSet layout;
-  char buffer[2048];
 
 #ifdef HAVE_XRANDR
   XRRScreenResources *res = XRRGetScreenResources(dpy, DefaultRootWindow(dpy));
   if (!res) {
-    vlog.error("XRRGetScreenResources failed");
+    vlog.error(_("Failed to get screen layout"));
     return layout;
   }
   vncSetGlueContext(dpy, res);
@@ -646,8 +655,7 @@ rfb::ScreenSet XDesktop::computeScreenLayout()
                                   geometry->height(), 0));
 
   vlog.debug("Detected screen layout:");
-  layout.print(buffer, sizeof(buffer));
-  vlog.debug("%s", buffer);
+  vlog.debug("%s", layout.print().c_str());
 
   return layout;
 }
@@ -693,7 +701,7 @@ unsigned int XDesktop::setScreenLayout(int fb_width, int fb_height,
 #ifdef HAVE_XRANDR
   XRRScreenResources *res = XRRGetScreenResources(dpy, DefaultRootWindow(dpy));
   if (!res) {
-    vlog.error("XRRGetScreenResources failed");
+    vlog.error(_("Failed to get screen layout"));
     return rfb::resultProhibited;
   }
   vncSetGlueContext(dpy, res);
@@ -795,7 +803,7 @@ unsigned int XDesktop::setScreenLayout(int fb_width, int fb_height,
       fb_width = swidth;
       fb_height = sheight;
     } else {
-      vlog.error("Failed to find smaller or equal screen size");
+      vlog.error(_("Failed to find a suitable screen size"));
       XRRFreeScreenResources(res);
       return rfb::resultInvalid;
     }
@@ -819,7 +827,7 @@ unsigned int XDesktop::setScreenLayout(int fb_width, int fb_height,
       TXWindow::handleXEvents(dpy);
     }
   } else {
-    vlog.error("XSendEvent failed");
+    vlog.debug("XSendEvent failed");
   }
 
   /* The protocol requires that an error is returned if the requested
@@ -1002,16 +1010,16 @@ bool XDesktop::handleGlobalEvent(XEvent* ev) {
 void XDesktop::queryApproved()
 {
   assert(isRunning());
-  server->approveConnection(queryConnectSock, true, nullptr);
-  queryConnectSock = nullptr;
+  server->approveConnection(pendingQuery, true, nullptr);
+  pendingQuery = nullptr;
 }
 
 void XDesktop::queryRejected()
 {
   assert(isRunning());
-  server->approveConnection(queryConnectSock, false,
-                            "Connection rejected by local user");
-  queryConnectSock = nullptr;
+  server->approveConnection(pendingQuery, false,
+                            _("Connection rejected by local user"));
+  pendingQuery = nullptr;
 }
 
 #ifdef HAVE_XFIXES
@@ -1055,7 +1063,7 @@ bool XDesktop::setCursor()
     server->setCursor(cim->width, cim->height, {cim->xhot, cim->yhot},
                       cursorData);
   } catch (std::exception& e) {
-    vlog.error("XserverDesktop::setCursor: %s",e.what());
+    vlog.error(_("Failed to update cursor: %s"), e.what());
   }
 
   delete [] cursorData;

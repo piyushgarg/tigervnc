@@ -1,5 +1,5 @@
 /* Copyright (C) 2002-2005 RealVNC Ltd.  All Rights Reserved.
- * Copyright (C) 2011-2019 Brian P. Hinz
+ * Copyright (C) 2011-2026 Brian P. Hinz
  *
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -37,8 +37,22 @@ abstract public class InStream {
   public int check(int itemSize, int nItems, boolean wait) {
     int nAvail;
 
-    if (itemSize > (end - ptr))
+    if (itemSize > (end - ptr)) {
+      if (restorePoint >= 0) {
+        // Need more data with a restore point active - rewind to the
+        // restore point so overrun()'s buffer compaction preserves the
+        // data between restorePoint and ptr, then fix both up afterwards.
+        int restoreDiff = ptr - restorePoint;
+        ptr = restorePoint;
+        int ret = overrun(itemSize + restoreDiff, nItems, wait);
+        restorePoint = ptr;
+        ptr += restoreDiff;
+        if (ret == 0)
+          return 0;
+      } else {
         return overrun(itemSize, nItems, wait);
+      }
+    }
 
     nAvail = (end - ptr) / itemSize;
     if (nAvail < nItems)
@@ -54,7 +68,9 @@ abstract public class InStream {
   // be read without blocking.  It returns true if this is the case, false
   // otherwise.  The length must be "small" (less than the buffer size).
 
-  public final boolean checkNoWait(int length) { return check(length, 1, false)!=0; }
+  public final boolean checkNoWait(int length) {
+    return length == 0 || check(length, 1, false) != 0;
+  }
 
   // readU/SN() methods read unsigned and signed N-bit integers.
 
@@ -93,6 +109,8 @@ abstract public class InStream {
   // higher if you need longer strings.
 
   public static int maxStringLength = 65535;
+
+  public static final int maxBufSize = 32 * 1024 * 1024;
 
   public final void skip(int bytes) {
     while (bytes > 0) {
@@ -149,8 +167,31 @@ abstract public class InStream {
     return overrun(itemSize, nItems, true);
   }
 
+  public final void setRestorePoint() {
+    restorePoint = ptr;
+  }
+
+  public final void clearRestorePoint() {
+    restorePoint = -1;
+  }
+
+  public final void gotoRestorePoint() {
+    if (restorePoint != -1) {
+      ptr = restorePoint;
+      restorePoint = -1;
+    }
+  }
+
+  public final boolean hasDataOrRestore(int length) {
+    if (checkNoWait(length))
+      return true;
+    gotoRestorePoint();
+    return false;
+  }
+
   protected InStream() {}
   protected byte[] b;
   protected int ptr;
   protected int end;
+  protected int restorePoint = -1;
 }

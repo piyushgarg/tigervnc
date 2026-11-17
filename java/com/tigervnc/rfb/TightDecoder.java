@@ -1,7 +1,7 @@
 /* Copyright (C) 2000-2003 Constantin Kaplinsky.  All Rights Reserved.
  * Copyright 2004-2005 Cendio AB.
  * Copyright (C) 2011 D. R. Commander.  All Rights Reserved.
- * Copyright (C) 2011-2019 Brian P. Hinz
+ * Copyright (C) 2011-2026 Brian P. Hinz
  *
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -56,6 +56,13 @@ public class TightDecoder extends Decoder {
     zis = new ZlibInStream[4];
     for (int i = 0; i < 4; i++)
       zis[i] = new ZlibInStream();
+  }
+
+  // Each ZlibInStream holds a native (off-heap) Inflater that must be
+  // explicitly released -- see Decoder.close().
+  public void close() {
+    for (int i = 0; i < 4; i++)
+      zis[i].deinit();
   }
 
   public void readRect(Rect r, InStream is,
@@ -170,9 +177,9 @@ public class TightDecoder extends Decoder {
 
     // Resets or use of zlib pose the same problem, so merge them
     if ((comp_ctl_a & 0x80) == 0x00)
-      comp_ctl_a |= 1 << ((comp_ctl_a >> 4) & 0x03);
+      comp_ctl_a |= (byte)(1 << ((comp_ctl_a >> 4) & 0x03));
     if ((comp_ctl_b & 0x80) == 0x00)
-      comp_ctl_b |= 1 << ((comp_ctl_b >> 4) & 0x03);
+      comp_ctl_b |= (byte)(1 << ((comp_ctl_b >> 4) & 0x03));
 
     if (((comp_ctl_a & 0x0f) & (comp_ctl_b & 0x0f)) != 0)
       return true;
@@ -531,7 +538,7 @@ public class TightDecoder extends Decoder {
       while (h > 0) {
         int endOfRow = ptr.position() + w;
         while (ptr.position() < endOfRow) {
-          ptr.put(palette.get(srcPtr.get()));
+          ptr.put(palette.get(srcPtr.get() & 0xff));
         }
         ptr.position(ptr.position() + pad);
         h--;
@@ -571,7 +578,7 @@ public class TightDecoder extends Decoder {
       while (h > 0) {
         int endOfRow = ptr.position() + w;
         while (ptr.position() < endOfRow) {
-          ptr.put(palette.get(srcPtr.get()));
+          ptr.put(palette.get(srcPtr.get() & 0xff));
         }
         ptr.position(ptr.position() + pad);
         h--;

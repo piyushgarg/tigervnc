@@ -33,6 +33,7 @@
 #include <rdr/FdOutStream.h>
 #include <core/Logger_stdio.h>
 #include <core/LogWriter.h>
+#include <core/i18n.h>
 
 #include "parameters.h"
 #include "GSocketSource.h"
@@ -70,21 +71,26 @@ void fatal_error(const char *error, ...) {
 
 static void printVersion(FILE *fp)
 {
-  fprintf(fp, "TigerVNC server version %s\n", PACKAGE_VERSION);
+  fprintf(fp, _("TigerVNC server version %s, built %s\n"),
+          PACKAGE_VERSION, BUILD_TIMESTAMP);
 }
 
 static void usage()
 {
   printVersion(stderr);
-  fprintf(stderr, "\nUsage: %s [<parameters>]\n", programName);
-  fprintf(stderr, "       %s --version\n", programName);
-  fprintf(stderr,"\n"
-          "Parameters can be turned on with -<param> or off with -<param>=0\n"
-          "Parameters which take a value can be specified as "
-          "-<param> <value>\n"
-          "Other valid forms are <param>=<value> -<param>=<value> "
-          "--<param>=<value>\n"
-          "Parameter names are case-insensitive.  The parameters are:\n\n");
+  fprintf(stderr,
+          _("\n"
+            "Usage: %s [<parameters>]\n"
+            "       %s --version\n"),
+          programName, programName);
+  fprintf(stderr,
+          _("\n"
+            "Parameters can be turned on with -<param> or off with -<param>=0\n"
+            "Parameters which take a value can be specified as "
+            "-<param> <value>\n"
+            "Other valid forms are <param>=<value> -<param>=<value> "
+            "--<param>=<value>\n"
+            "Parameter names are case-insensitive.  The parameters are:\n\n"));
   core::Configuration::listParams(79, 14);
   exit(1);
 }
@@ -105,6 +111,8 @@ int main(int argc, char** argv)
   GSocketSource* monitor;
   rfb::SDesktop* desktop;
   rfb::VNCServerST* server;
+
+  setlocale(LC_ALL, "");
 
   programName = argv[0];
 
@@ -136,15 +144,15 @@ int main(int argc, char** argv)
     }
 
     if (argv[i][0] == '-') {
-      fprintf(stderr, "%s: Unrecognized option '%s'\n",
+      fprintf(stderr, _("%s: Unrecognized option '%s'\n"),
               programName, argv[i]);
-      fprintf(stderr, "See '%s --help' for more information.\n",
+      fprintf(stderr, _("See '%s --help' for more information.\n"),
               programName);
       exit(1);
     }
 
-    fprintf(stderr, "%s: Extra argument '%s'\n", programName, argv[i]);
-    fprintf(stderr, "See '%s --help' for more information.\n",
+    fprintf(stderr, _("%s: Extra argument '%s'\n"), programName, argv[i]);
+    fprintf(stderr, _("See '%s --help' for more information.\n"),
             programName);
     exit(1);
   }
@@ -152,7 +160,8 @@ int main(int argc, char** argv)
   try {
     if (rfbunixpath.getValueStr()[0] != '\0') {
       listeners.push_back(new network::UnixListener(rfbunixpath, rfbunixmode));
-      vlog.info("Listening on %s (mode %04o)", (const char*)rfbunixpath, (int)rfbunixmode);
+      vlog.info(_("Listening for VNC connections on %s (mode %04o)"),
+                (const char*)rfbunixpath, (int)rfbunixmode);
     }
 
     if ((int)rfbport != -1) {
@@ -168,13 +177,23 @@ int main(int argc, char** argv)
 
       if (!tcp_listeners.empty()) {
         listeners.splice (listeners.end(), tcp_listeners);
-        vlog.info("Listening for VNC connections on %s interface(s), port %d",
-                  localhostOnly ? "local" : (const char*)interface,
-                  (int)rfbport);
+        if (localhostOnly)
+          vlog.info(_("Listening for VNC connections on local "
+                      "interfaces, port %d"), (int)rfbport);
+        else
+          vlog.info(_("Listening for VNC connections on interface %s, "
+                      "port %d"),
+                    (const char*)interface, (int)rfbport);
       }
     }
   } catch (std::exception& e) {
     fprintf(stderr, "%s\n", e.what());
+    return -1;
+  }
+
+  if (listeners.empty()) {
+    vlog.error(_("No path or port configured for incoming "
+                  "connections"));
     return -1;
   }
 
@@ -183,15 +202,28 @@ int main(int argc, char** argv)
   sigtermTag = g_unix_signal_add(SIGTERM, CleanupSignalHandler, nullptr);
   sighupTag = g_unix_signal_add(SIGHUP, CleanupSignalHandler, nullptr);
 
+
+  desktop = nullptr;
   try {
-    if (PortalDesktop::available()) {
+    if (PortalDesktop::available())
       desktop = new PortalDesktop();
-    } else if (WaylandDesktop::available()) {
+  } catch (std::exception& e) {
+    vlog.debug("PortalDesktop unavailable: %s", e.what());
+  }
+
+  try {
+    if (!desktop && WaylandDesktop::available())
       desktop = new WaylandDesktop(loop);
-    } else {
-      fprintf(stderr, "No remote desktop implementation found.\n");
-      return -1;
-    }
+  } catch (std::exception& e) {
+    vlog.debug("WaylandDesktop unavailable: %s", e.what());
+  }
+
+  if (!desktop) {
+    vlog.error(_("Desktop does not support remote connections"));
+    return -1;
+  }
+
+  try {
     server = new rfb::VNCServerST(desktopName, desktop);
     timerSource = new RFBTimerSource();
     monitor = new GSocketSource(server, &listeners);

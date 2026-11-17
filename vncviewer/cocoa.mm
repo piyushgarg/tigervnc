@@ -232,29 +232,6 @@ bool cocoa_screens_have_separate_spaces()
   return [NSScreen screensHaveSeparateSpaces];
 }
 
-CGColorSpaceRef cocoa_win_color_space(Fl_Window *win)
-{
-  NSWindow *nsw;
-  NSColorSpace *nscs;
-
-  nsw = (NSWindow*)fl_xid(win);
-  assert(nsw);
-
-  nscs = [nsw colorSpace];
-  if (nscs == nil) {
-    // Offscreen, so return standard SRGB color space
-    assert(false);
-    return CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-  }
-
-  CGColorSpaceRef lut = [nscs CGColorSpace];
-
-  // We want a permanent reference, not an autorelease
-  CGColorSpaceRetain(lut);
-
-  return lut;
-}
-
 bool cocoa_win_is_zoomed(Fl_Window *win)
 {
   NSWindow *nsw;
@@ -269,4 +246,27 @@ void cocoa_win_zoom(Fl_Window *win)
   nsw = (NSWindow*)fl_xid(win);
   assert(nsw);
   [nsw zoom:nsw];
+}
+
+void cocoa_enable_minimize(Fl_Window *win)
+{
+  NSWindow *nsw;
+  nsw = (NSWindow*)fl_xid(win);
+  assert(nsw);
+  nsw.styleMask |= NSWindowStyleMaskMiniaturizable;
+}
+
+void cocoa_event_delay(double seconds)
+{
+  CGEventSourceRef event = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState);
+  CGEventSourceSetLocalEventsSuppressionInterval(event, seconds);
+  CFRelease(event);
+}
+
+void cocoa_set_cursor_pos(int x, int y)
+{
+  CGPoint new_pos;
+  new_pos.x = x;
+  new_pos.y = y;
+  CGWarpMouseCursorPosition(new_pos);
 }

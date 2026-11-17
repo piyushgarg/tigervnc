@@ -22,7 +22,7 @@
 
 #include <core/LogWriter.h>
 
-#include <winvnc/ManagedListener.h>
+#include "ManagedListener.h"
 
 using namespace winvnc;
 using namespace core;
@@ -50,7 +50,7 @@ ManagedListener::~ManagedListener() {
 void ManagedListener::setServer(rfb::VNCServer* svr) {
   if (svr == server)
     return;
-  vlog.info("Set server to %p", svr);
+  vlog.debug("Set server to %p", svr);
   server = svr;
   refresh();
 }
@@ -58,14 +58,14 @@ void ManagedListener::setServer(rfb::VNCServer* svr) {
 void ManagedListener::setPort(int port_, bool localOnly_) {
   if ((port_ == port) && (localOnly == localOnly_))
     return;
-  vlog.info("Set port to %d", port_);
+  vlog.debug("Set port to %d", port_);
   port = port_;
   localOnly = localOnly_;
   refresh();
 }
 
 void ManagedListener::setFilter(const char* filterStr) {
-  vlog.info("Set filter to %s", filterStr);
+  vlog.debug("Set filter to %s", filterStr);
   delete filter;
   filter = new network::TcpFilter(filterStr);
   if (!sockets.empty() && !localOnly) {
@@ -118,7 +118,7 @@ void ManagedListener::refresh() {
       for (iter2 = sockets.begin(); iter2 != iter; ++iter2)
         manager->remListener(*iter2);
       for (; iter2 != sockets.end(); ++iter2)
-        delete *iter;
+        delete *iter2;
       sockets.clear();
       throw;
     }

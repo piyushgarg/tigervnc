@@ -24,6 +24,7 @@ set(JAVA_PKCS11_PROVIDER_CLASS "sun.security.pkcs11.SunPKCS11" CACHE STRING "PKC
 set(JAVA_PKCS11_PROVIDER_ARG NOTFOUND CACHE STRING "Path to the PKCS11 security provider class config file")
 set(JAVA_TSA_URL NOTFOUND CACHE STRING "URL of Time Stamping Authority (TSA)")
 set(JAVA_CERT_CHAIN NOTFOUND CACHE STRING "Path to CA certificate chain file")
+option(JAVA_SIGN_JAR "Sign Java viewer jar" ON)
 
 if(NOT BUILD)
 	STRING(TIMESTAMP BUILD "%Y%m%d" UTC)
@@ -31,93 +32,31 @@ endif()
 STRING(TIMESTAMP JAVA_DATE "%Y-%m-%d" UTC)
 STRING(TIMESTAMP JAVA_TIME "%H:%M:%S" UTC)
 
-set(JAVA_SOURCES "")
-set(JAVA_CLASSES "")
-
-set(JSCH_CLASSNAMES
-  DH
-  DHEC256
-  DHEC384
-  DHEC521
-  DHECN
-  DHGEX256
-  DHG1
-  DHG14
-  DHGEX
-  ECDH
-  JSch
-  Session
-  UserAuth
-  UserAuthKeyboardInteractive
-  UserAuthPassword
-  UserAuthPublicKey
-  UserAuthNone
-  jce/AES128CBC
-  jce/AES128CTR
-  jce/AES192CBC
-  jce/AES192CTR
-  jce/AES256CBC
-  jce/AES256CTR
-  jce/ARCFOUR
-  jce/ARCFOUR128
-  jce/ARCFOUR256
-  jce/BlowfishCBC
-  jce/DH
-	jce/ECDH256
-	jce/ECDH384
-	jce/ECDH521
-	jce/ECDHN
-  jce/HMAC
-  jce/HMACMD5
-  jce/HMACMD596
-  jce/HMACSHA1
-  jce/HMACSHA196
-  jce/HMACSHA256
-  jce/HMACSHA512
-  jce/KeyPairGenDSA
-  jce/KeyPairGenECDSA
-  jce/KeyPairGenRSA
-  jce/MD5
-  jce/PBKDF
-  jce/Random
-  jce/SHA1
-  jce/SHA256
-  jce/SHA384
-  jce/SHA512
-  jce/SignatureDSA
-  jce/SignatureECDSA
-  jce/SignatureRSA
-  jce/TripleDESCBC
-  jce/TripleDESCTR
-  jcraft/Compression
-  jcraft/HMAC
-  jcraft/HMACMD596
-  jcraft/HMACMD5
-  jcraft/HMACSHA196
-  jcraft/HMACSHA1)
-
-foreach(class ${JSCH_CLASSNAMES})
-  set(JAVA_SOURCES ${JAVA_SOURCES} com/jcraft/jsch/${class}.java)
-  set(JAVA_CLASSES ${JAVA_CLASSES}
-    ${BINDIR}/com/jcraft/jsch/${class}.class)
-endforeach()
-
 file(GLOB DEPEND_SOURCES
   ${SRCDIR}/${CLASSPATH}/*.java
   ${SRCDIR}/com/tigervnc/rfb/*.java
   ${SRCDIR}/com/tigervnc/rdr/*.java
-  ${SRCDIR}/com/tigervnc/network/*.java
-  ${SRCDIR}/com/jcraft/jsch/*.java
-  ${SRCDIR}/com/jcraft/jsch/jcraft/*.java
+  ${SRCDIR}/com/tigervnc/network/*.java)
+
+file(GLOB JSCH_SOURCES
+  ${SRCDIR}/com/jcraft/jsch/*.java)
+list(FILTER JSCH_SOURCES EXCLUDE REGEX "SSHAgentConnector|WindowsSSHAgentConnector|PageantConnector|JUnixSocketFactory")
+
+file(GLOB PROVIDER_SOURCES
+  ${SRCDIR}/com/jcraft/jsch/jce/*.java
+  ${SRCDIR}/com/jcraft/jsch/bc/*.java
   ${SRCDIR}/com/jcraft/jsch/jgss/*.java
-  ${SRCDIR}/com/jcraft/jzlib/*.java)
+  ${SRCDIR}/com/jcraft/jsch/juz/*.java
+  ${SRCDIR}/com/jcraft/jsch/jbcrypt/*.java)
+
+set(JAVA_CLASSES ${BINDIR}/${CLASSPATH}/VncViewer.class)
 
 string(REGEX REPLACE " " ";" JAVACFLAGS "${JAVACFLAGS}")
 add_custom_command(OUTPUT ${JAVA_CLASSES}
-  DEPENDS ${JAVA_SOURCES} ${DEPEND_SOURCES}
+  DEPENDS ${DEPEND_SOURCES} ${JSCH_SOURCES} ${PROVIDER_SOURCES}
   COMMAND ${JAVA_COMPILE}
   ARGS ${JAVACFLAGS} -sourcepath ${SRCDIR} -d ${BINDIR} 
-    ${CLASSPATH}/VncViewer.java ${JAVA_SOURCES}
+    ${DEPEND_SOURCES} ${JSCH_SOURCES} ${PROVIDER_SOURCES}
 	WORKING_DIRECTORY ${SRCDIR})
 
 configure_file(${CLASSPATH}/timestamp.in ${CLASSPATH}/timestamp)
@@ -142,6 +81,25 @@ endif()
 string(REGEX REPLACE "jar" "" Java_PATH ${Java_JAR_EXECUTABLE})
 string(REGEX REPLACE ".exe" "" Java_PATH ${Java_PATH})
 
+set(SIGN_JAR_COMMAND)
+if(JAVA_SIGN_JAR)
+  set(SIGN_JAR_COMMAND
+    COMMAND ${CMAKE_COMMAND}
+    ARGS -DJava_PATH=${Java_PATH} -DJAR_FILE=${BINDIR}/VncViewer.jar
+      -DJAVA_KEYSTORE=${JAVA_KEYSTORE}
+      -DJAVA_KEYSTORE_TYPE=${JAVA_KEYSTORE_TYPE}
+      -DJAVA_STOREPASS=${JAVA_STOREPASS}
+      -DJAVA_PKCS11_PROVIDER_CLASS=${JAVA_PKCS11_PROVIDER_CLASS}
+      -DJAVA_PKCS11_PROVIDER_ARG=${JAVA_PKCS11_PROVIDER_ARG}
+      -DJAVA_KEYPASS=${JAVA_KEYPASS}
+      -DJAVA_KEY_ALIAS=${JAVA_KEY_ALIAS}
+      -DJAVA_TSA_URL=${JAVA_TSA_URL}
+      -DJAVA_CERT_CHAIN=${JAVA_CERT_CHAIN}
+      -P ${SRCDIR}/cmake/SignJar.cmake)
+else()
+  message(STATUS "Java viewer jar signing disabled")
+endif()
+
 add_custom_command(OUTPUT VncViewer.jar
   DEPENDS ${JAVA_CLASSES}
     ${SRCDIR}/${CLASSPATH}/MANIFEST.MF
@@ -158,23 +116,10 @@ add_custom_command(OUTPUT VncViewer.jar
     com/tigervnc/rfb/*.class
     com/tigervnc/rdr/*.class
     com/tigervnc/network/*.class
-    com/jcraft/jzlib/*.class
-    com/jcraft/jsch/jcraft/*.class
-    com/jcraft/jsch/jce/*.class
     com/jcraft/jsch/*.class
+    com/jcraft/jsch/*/*.class
     com/tigervnc/vncviewer/*.png
     com/tigervnc/vncviewer/tigervnc.ico
-  COMMAND ${CMAKE_COMMAND}
-  ARGS -DJava_PATH=${Java_PATH} -DJAR_FILE=${BINDIR}/VncViewer.jar
-    -DJAVA_KEYSTORE=${JAVA_KEYSTORE}
-    -DJAVA_KEYSTORE_TYPE=${JAVA_KEYSTORE_TYPE}
-    -DJAVA_STOREPASS=${JAVA_STOREPASS}
-    -DJAVA_PKCS11_PROVIDER_CLASS=${JAVA_PKCS11_PROVIDER_CLASS}
-    -DJAVA_PKCS11_PROVIDER_ARG=${JAVA_PKCS11_PROVIDER_ARG}
-    -DJAVA_KEYPASS=${JAVA_KEYPASS}
-    -DJAVA_KEY_ALIAS=${JAVA_KEY_ALIAS}
-    -DJAVA_TSA_URL=${JAVA_TSA_URL}
-    -DJAVA_CERT_CHAIN=${JAVA_CERT_CHAIN}
-    -P ${SRCDIR}/cmake/SignJar.cmake)
+  ${SIGN_JAR_COMMAND})
 
 add_custom_target(java ALL DEPENDS VncViewer.jar)

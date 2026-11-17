@@ -16,6 +16,10 @@
  * USA.
  */
 
+#ifdef HAVE_CONFIG_H
+#include <config.h>
+#endif
+
 #include <unistd.h>
 
 #include <stdexcept>
@@ -26,6 +30,7 @@
 #include <spa/debug/pod.h>
 
 #include <core/LogWriter.h>
+#include <core/i18n.h>
 #include <core/string.h>
 #include <rfb/PixelFormat.h>
 
@@ -69,14 +74,14 @@ PipeWireStream::PipeWireStream(int pipeWireFd_, int nodeId)
   context = pw_context_new(source->getLoop(), nullptr, 0);
   if (!context) {
     delete source;
-    throw std::runtime_error("Failed to create PipeWire context");
+    throw std::runtime_error(_("Failed to create PipeWire context"));
   }
 
   core = pw_context_connect_fd(context, pipeWireFd_, nullptr, 0);
   if (!core) {
     pw_context_destroy(context);
     delete source;
-    throw std::runtime_error("Failed to connect to PipeWire FD");
+    throw std::runtime_error(_("Failed to connect to PipeWire server"));
   }
 
   start(nodeId);
@@ -84,6 +89,7 @@ PipeWireStream::PipeWireStream(int pipeWireFd_, int nodeId)
 
 PipeWireStream::~PipeWireStream()
 {
+  active = false;
   pw_stream_disconnect(stream);
   // Iterate the loop once after disconnect to ensure proper cleanup.
   // Without this, we saw issues when re-initializing PipeWire
@@ -116,7 +122,7 @@ void PipeWireStream::start(int nodeId)
 
   stream = pw_stream_new(core, "w0vncserver", props);
   if (!stream)
-    throw std::runtime_error("Failed to create PipeWire stream");
+    throw std::runtime_error(_("Failed to create PipeWire stream"));
 
   pw_stream_add_listener(stream, &streamListener, &streamEventsHandler, this);
 
@@ -145,7 +151,7 @@ void PipeWireStream::start(int nodeId)
                         (pw_stream_flags)(PW_STREAM_FLAG_AUTOCONNECT |
                         PW_STREAM_FLAG_MAP_BUFFERS),
                         params, 1) < 0) {
-    throw std::runtime_error("Failed to connect PipeWire stream");
+    throw std::runtime_error(_("Failed to connect PipeWire stream"));
   }
 }
 
@@ -158,8 +164,9 @@ void PipeWireStream::handleStreamStateChanged(enum pw_stream_state old,
 
   switch (state) {
   case PW_STREAM_STATE_UNCONNECTED:
-    vlog.debug("PipeWire stream disconnected");
-    break;
+    vlog.info("PipeWire stream disconnected");
+    stopped();
+    return;
   case PW_STREAM_STATE_PAUSED:
     // This can happen if the compositor shuts down the session, e.g.
     // a user logs out.
@@ -167,7 +174,7 @@ void PipeWireStream::handleStreamStateChanged(enum pw_stream_state old,
       stopped();
     break;
   case PW_STREAM_STATE_ERROR:
-    vlog.error("PipeWire stream error: %s", error);
+    vlog.error(_("Error communicating with PipeWire: %s"), error);
     stopped();
     return;
   default:
@@ -339,7 +346,7 @@ rfb::PixelFormat PipeWireStream::convertPixelformat(int spaFormat)
     return rfb::PixelFormat(24, 24, true, true, 255, 255, 255,
                             0, 8, 16);
   default:
-    throw std::runtime_error(core::format("format %d not supported",
-                                          spaFormat));
+    throw std::invalid_argument(core::format("format %d not supported",
+                                             spaFormat));
   }
 }

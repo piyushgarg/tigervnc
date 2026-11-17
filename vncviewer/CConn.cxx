@@ -37,6 +37,7 @@
 #include <core/Exception.h>
 #include <core/LogWriter.h>
 #include <core/Timer.h>
+#include <core/i18n.h>
 #include <core/string.h>
 #include <core/time.h>
 #include <core/xdgdirs.h>
@@ -63,21 +64,17 @@
 
 #include "fltk/layout.h"
 #include "fltk/util.h"
+#include "AudioOutput.h"
 #include "AuthDialog.h"
 #include "CConn.h"
 #include "OptionsDialog.h"
 #include "DesktopWindow.h"
 #include "PlatformPixelBuffer.h"
-#include "i18n.h"
 #include "parameters.h"
 #include "vncviewer.h"
 
 std::string CConn::savedUsername;
 std::string CConn::savedPassword;
-
-#ifdef WIN32
-#include "win32.h"
-#endif
 
 static core::LogWriter vlog("CConn");
 
@@ -160,6 +157,7 @@ static std::string getProxySetting()
 CConn::CConn()
   : serverPort(0), sock(nullptr),
     msgTimer(this, &CConn::processNextMsg), desktop(nullptr),
+    audioOutput(nullptr),
     updateCount(0), pixelCount(0),
     lastServerEncoding((unsigned int)-1), bpsEstimate(20000000)
 {
@@ -169,6 +167,16 @@ CConn::CConn()
   supportsCursorPosition = true;
   supportsDesktopResize = true;
   supportsLEDState = true;
+
+#ifdef HAVE_AUDIO
+  // Only ask the server to send audio if there is a device that can
+  // play it. Opening that device is deferred until the server actually
+  // has something for us.
+  if (playAudio) {
+    audioOutput = AudioOutput::create();
+    supportsAudio = audioOutput != nullptr;
+  }
+#endif
 
   if (customCompressLevel)
     setCompressLevel(::compressLevel);
@@ -187,6 +195,8 @@ CConn::~CConn()
 
   if (desktop)
     delete desktop;
+
+  delete audioOutput;
 
   if (sock) {
     struct timeval now;
@@ -385,7 +395,7 @@ void CConn::processNextMsg(core::Timer*)
                        "given by the server:\n\n%s"), e.what());
   } catch (std::exception& e) {
     vlog.error("%s", e.what());
-    abort_connection_with_unexpected_error(e);
+    abort_connection_unexpected(e);
   }
 
   recursing = false;
@@ -408,8 +418,7 @@ void CConn::processNextMsg(core::Timer*)
 
 ////////////////////// CConnection callback methods //////////////////////
 
-void CConn::getUserPasswd(bool secure, std::string *user,
-                          std::string *password)
+void CConn::getUserPasswd(std::string *user, std::string *password)
 {
   const char *passwordFileName(passwordFile);
   int ret_val;
@@ -446,7 +455,9 @@ void CConn::getUserPasswd(bool secure, std::string *user,
 
     fp = fopen(passwordFileName, "rb");
     if (!fp)
-      throw core::posix_error(_("Opening password file failed"), errno);
+      throw core::posix_error(
+        core::format(_("Failed to open \"%s\""), passwordFileName),
+        errno);
 
     obfPwd.resize(fread(obfPwd.data(), 1, obfPwd.size(), fp));
     fclose(fp);
@@ -456,7 +467,7 @@ void CConn::getUserPasswd(bool secure, std::string *user,
     return;
   }
 
-  AuthDialog d(secure, user != nullptr, password != nullptr);
+  AuthDialog d(isSecure(), user != nullptr, password != nullptr);
   d.show();
   while (d.shown())
     Fl::wait();
@@ -489,13 +500,7 @@ void CConn::getUserPasswd(bool secure, std::string *user,
 // server the pixel format and encodings to use and request the first update.
 void CConn::initDone()
 {
-  // If using AutoSelect with old servers, start in FullColor
-  // mode. See comment in autoSelectFormatAndEncoding. 
-  if (server.beforeVersion(3, 8) && autoSelect)
-    fullColour.setParam(true);
-
   desktop = new DesktopWindow(server.width(), server.height(), this);
-  fullColourPF = desktop->getPreferredPF();
 
   // Force a switch to the format and encoding we'd like
   updateEncoding();
@@ -506,7 +511,10 @@ bool CConn::verifyCertificate(unsigned int status,
                               const uint8_t* certificate, size_t length)
 {
 #ifndef HAVE_GNUTLS
-  throw rdr::Exception(_("TLS support not enabled"));
+  (void)status;
+  (void)certificate;
+  (void)length;
+  throw std::logic_error("TLS support not enabled");
 #else
   const unsigned allowed_errors =
     GNUTLS_CERT_INVALID |
@@ -622,16 +630,13 @@ bool CConn::verifyCertificate(unsigned int status,
     if (status & (GNUTLS_CERT_INVALID |
                   GNUTLS_CERT_SIGNER_NOT_FOUND |
                   GNUTLS_CERT_SIGNER_NOT_CA)) {
-      text = core::format(_(
-        "This certificate has been signed by an unknown authority:\n"
-        "\n"
-        "%s\n"
-        "\n"
-        "Someone could be trying to impersonate the site and you "
-        "should not continue.\n"
-        "\n"
-        "Do you want to make an exception for this server?"),
-        info.c_str());
+      text = core::format(
+        "%s\n\n%s\n\n%s\n\n%s",
+        _("This certificate has been signed by an unknown authority:"),
+        info.c_str(),
+        _("Someone could be trying to impersonate the site and you "
+          "should not continue."),
+        _("Do you want to make an exception for this server?"));
 
       fl_message_title(_("Unknown certificate issuer"));
       if (fl_choice("%s", nullptr, fl_cancel, _("Add exception"),
@@ -644,16 +649,13 @@ bool CConn::verifyCertificate(unsigned int status,
     }
 
     if (status & GNUTLS_CERT_NOT_ACTIVATED) {
-      text = core::format(_(
-        "This certificate is not yet valid:\n"
-        "\n"
-        "%s\n"
-        "\n"
-        "Someone could be trying to impersonate the site and you "
-        "should not continue.\n"
-        "\n"
-        "Do you want to make an exception for this server?"),
-        info.c_str());
+      text = core::format(
+        "%s\n\n%s\n\n%s\n\n%s",
+        _("This certificate is not yet valid:"),
+        info.c_str(),
+        _("Someone could be trying to impersonate the site and you "
+          "should not continue."),
+        _("Do you want to make an exception for this server?"));
 
       fl_message_title(_("Certificate is not yet valid"));
       if (fl_choice("%s", nullptr, fl_cancel, _("Add exception"),
@@ -664,16 +666,13 @@ bool CConn::verifyCertificate(unsigned int status,
     }
 
     if (status & GNUTLS_CERT_EXPIRED) {
-      text = core::format(_(
-        "This certificate has expired:\n"
-        "\n"
-        "%s\n"
-        "\n"
-        "Someone could be trying to impersonate the site and you "
-        "should not continue.\n"
-        "\n"
-        "Do you want to make an exception for this server?"),
-        info.c_str());
+      text = core::format(
+        "%s\n\n%s\n\n%s\n\n%s",
+        _("This certificate has expired:"),
+        info.c_str(),
+        _("Someone could be trying to impersonate the site and you "
+          "should not continue."),
+        _("Do you want to make an exception for this server?"));
 
       fl_message_title(_("Expired certificate"));
       if (fl_choice("%s", nullptr, fl_cancel, _("Add exception"),
@@ -684,16 +683,13 @@ bool CConn::verifyCertificate(unsigned int status,
     }
 
     if (status & GNUTLS_CERT_INSECURE_ALGORITHM) {
-      text = core::format(_(
-        "This certificate uses an insecure algorithm:\n"
-        "\n"
-        "%s\n"
-        "\n"
-        "Someone could be trying to impersonate the site and you "
-        "should not continue.\n"
-        "\n"
-        "Do you want to make an exception for this server?"),
-        info.c_str());
+      text = core::format(
+        "%s\n\n%s\n\n%s\n\n%s",
+        _("This certificate uses an insecure algorithm:"),
+        info.c_str(),
+        _("Someone could be trying to impersonate the site and you "
+          "should not continue."),
+        _("Do you want to make an exception for this server?"));
 
       fl_message_title(_("Insecure certificate algorithm"));
       if (fl_choice("%s", nullptr, fl_cancel, _("Add exception"),
@@ -704,17 +700,16 @@ bool CConn::verifyCertificate(unsigned int status,
     }
 
     if (status & GNUTLS_CERT_UNEXPECTED_OWNER) {
-      text = core::format(_(
-        "The specified hostname \"%s\" does not match the certificate "
-        "provided by the server:\n"
-        "\n"
-        "%s\n"
-        "\n"
-        "Someone could be trying to impersonate the site and you "
-        "should not continue.\n"
-        "\n"
-        "Do you want to make an exception for this server?"),
-        getServerName(), info.c_str());
+      text = core::format(
+        "%s\n\n%s\n\n%s\n\n%s",
+        core::format(
+          _("The specified hostname \"%s\" does not match the "
+            "certificate provided by the server:"),
+          getServerName()).c_str(),
+        info.c_str(),
+        _("Someone could be trying to impersonate the site and you "
+          "should not continue."),
+        _("Do you want to make an exception for this server?"));
 
       fl_message_title(_("Certificate hostname mismatch"));
       if (fl_choice("%s", nullptr, fl_cancel, _("Add exception"),
@@ -725,9 +720,9 @@ bool CConn::verifyCertificate(unsigned int status,
     }
 
     if (status != 0) {
-      vlog.error(_("Unhandled server certificate problems: 0x%x"),
+      vlog.error("Unhandled server certificate problems: 0x%x",
                  status);
-      throw std::logic_error(_("Unhandled server certificate problems"));
+      throw std::logic_error("Unhandled server certificate problems");
     }
   } else if (known == GNUTLS_E_CERTIFICATE_KEY_MISMATCH) {
     std::string text;
@@ -738,18 +733,15 @@ bool CConn::verifyCertificate(unsigned int status,
     if (status & (GNUTLS_CERT_INVALID |
                   GNUTLS_CERT_SIGNER_NOT_FOUND |
                   GNUTLS_CERT_SIGNER_NOT_CA)) {
-      text = core::format(_(
-        "This host is previously known with a different certificate, "
-        "and the new certificate has been signed by an unknown "
-        "authority:\n"
-        "\n"
-        "%s\n"
-        "\n"
-        "Someone could be trying to impersonate the site and you "
-        "should not continue.\n"
-        "\n"
-        "Do you want to make an exception for this server?"),
-        info.c_str());
+      text = core::format(
+        "%s\n\n%s\n\n%s\n\n%s",
+        _("This host is previously known with a different certificate, "
+          "and the new certificate has been signed by an unknown "
+          "authority:"),
+        info.c_str(),
+        _("Someone could be trying to impersonate the site and you "
+          "should not continue."),
+        _("Do you want to make an exception for this server?"));
 
       fl_message_title(_("Unexpected server certificate"));
       if (fl_choice("%s", nullptr, fl_cancel, _("Add exception"),
@@ -762,17 +754,14 @@ bool CConn::verifyCertificate(unsigned int status,
     }
 
     if (status & GNUTLS_CERT_NOT_ACTIVATED) {
-      text = core::format(_(
-        "This host is previously known with a different certificate, "
-        "and the new certificate is not yet valid:\n"
-        "\n"
-        "%s\n"
-        "\n"
-        "Someone could be trying to impersonate the site and you "
-        "should not continue.\n"
-        "\n"
-        "Do you want to make an exception for this server?"),
-        info.c_str());
+      text = core::format(
+        "%s\n\n%s\n\n%s\n\n%s",
+        _("This host is previously known with a different certificate, "
+          "and the new certificate is not yet valid:"),
+        info.c_str(),
+        _("Someone could be trying to impersonate the site and you "
+          "should not continue."),
+        _("Do you want to make an exception for this server?"));
 
       fl_message_title(_("Unexpected server certificate"));
       if (fl_choice("%s", nullptr, fl_cancel, _("Add exception"),
@@ -783,17 +772,14 @@ bool CConn::verifyCertificate(unsigned int status,
     }
 
     if (status & GNUTLS_CERT_EXPIRED) {
-      text = core::format(_(
-        "This host is previously known with a different certificate, "
-        "and the new certificate has expired:\n"
-        "\n"
-        "%s\n"
-        "\n"
-        "Someone could be trying to impersonate the site and you "
-        "should not continue.\n"
-        "\n"
-        "Do you want to make an exception for this server?"),
-        info.c_str());
+      text = core::format(
+        "%s\n\n%s\n\n%s\n\n%s",
+        _("This host is previously known with a different certificate, "
+          "and the new certificate has expired:"),
+        info.c_str(),
+        _("Someone could be trying to impersonate the site and you "
+          "should not continue."),
+        _("Do you want to make an exception for this server?"));
 
       fl_message_title(_("Unexpected server certificate"));
       if (fl_choice("%s", nullptr, fl_cancel, _("Add exception"),
@@ -804,17 +790,14 @@ bool CConn::verifyCertificate(unsigned int status,
     }
 
     if (status & GNUTLS_CERT_INSECURE_ALGORITHM) {
-      text = core::format(_(
-        "This host is previously known with a different certificate, "
-        "and the new certificate uses an insecure algorithm:\n"
-        "\n"
-        "%s\n"
-        "\n"
-        "Someone could be trying to impersonate the site and you "
-        "should not continue.\n"
-        "\n"
-        "Do you want to make an exception for this server?"),
-        info.c_str());
+      text = core::format(
+        "%s\n\n%s\n\n%s\n\n%s",
+        _("This host is previously known with a different certificate, "
+          "and the new certificate uses an insecure algorithm:"),
+        info.c_str(),
+        _("Someone could be trying to impersonate the site and you "
+          "should not continue."),
+        _("Do you want to make an exception for this server?"));
 
       fl_message_title(_("Unexpected server certificate"));
       if (fl_choice("%s", nullptr, fl_cancel, _("Add exception"),
@@ -825,18 +808,17 @@ bool CConn::verifyCertificate(unsigned int status,
     }
 
     if (status & GNUTLS_CERT_UNEXPECTED_OWNER) {
-      text = core::format(_(
-        "This host is previously known with a different certificate, "
-        "and the specified hostname \"%s\" does not match the new "
-        "certificate provided by the server:\n"
-        "\n"
-        "%s\n"
-        "\n"
-        "Someone could be trying to impersonate the site and you "
-        "should not continue.\n"
-        "\n"
-        "Do you want to make an exception for this server?"),
-        getServerName(), info.c_str());
+      text = core::format(
+        "%s\n\n%s\n\n%s\n\n%s",
+        core::format(
+          _("This host is previously known with a different "
+            "certificate, and the specified hostname \"%s\" does not "
+            "match the new certificate provided by the server:"),
+          getServerName()).c_str(),
+        info.c_str(),
+        _("Someone could be trying to impersonate the site and you "
+          "should not continue."),
+        _("Do you want to make an exception for this server?"));
 
       fl_message_title(_("Unexpected server certificate"));
       if (fl_choice("%s", nullptr, fl_cancel, _("Add exception"),
@@ -847,9 +829,9 @@ bool CConn::verifyCertificate(unsigned int status,
     }
 
     if (status != 0) {
-      vlog.error(_("Unhandled server certificate problems: 0x%x"),
+      vlog.error("Unhandled server certificate problems: 0x%x",
                  status);
-      throw std::logic_error(_("Unhandled server certificate problems"));
+      throw std::logic_error("Unhandled server certificate problems");
     }
   }
 
@@ -1018,6 +1000,30 @@ void CConn::handleClipboardData(const char* data)
   desktop->handleClipboardData(data);
 }
 
+void CConn::handleAudioBegin()
+{
+  if (audioOutput == nullptr)
+    return;
+
+  audioOutput->start();
+}
+
+void CConn::handleAudioEnd()
+{
+  if (audioOutput == nullptr)
+    return;
+
+  audioOutput->stop();
+}
+
+void CConn::handleAudioData(const uint8_t* data, size_t length)
+{
+  if (audioOutput == nullptr)
+    return;
+
+  audioOutput->play(data, length);
+}
+
 
 ////////////////////// Internal methods //////////////////////
 
@@ -1075,20 +1081,11 @@ void CConn::updateQualityLevel()
 void CConn::updatePixelFormat()
 {
   bool useFullColour;
-  rfb::PixelFormat pf;
-
-  if (server.beforeVersion(3, 8)) {
-    // Xvnc from TightVNC 1.2.9 sends out FramebufferUpdates with
-    // cursors "asynchronously". If this happens in the middle of a
-    // pixel format change, the server will encode the cursor with
-    // the old format, but the client will try to decode it
-    // according to the new format. This will lead to a
-    // crash. Therefore, we do not allow automatic format change for
-    // old servers.
-    return;
-  }
+  rfb::PixelFormat pf, fullColourPF;
 
   useFullColour = fullColour;
+
+  fullColourPF = getFramebuffer()->getPF();
 
   // If the bandwidth drops below 256 Kbps, we switch to palette mode.
   if (autoSelect) {

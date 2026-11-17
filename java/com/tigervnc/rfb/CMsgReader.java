@@ -1,5 +1,5 @@
 /* Copyright (C) 2002-2005 RealVNC Ltd.  All Rights Reserved.
- * Copyright (C) 2011-2019 Brian P. Hinz
+ * Copyright (C) 2011-2026 Brian P. Hinz
  * Copyright (C) 2017 Pierre Ossman for Cendio AB
  *
  * This is free software; you can redistribute it and/or modify
@@ -46,116 +46,215 @@ public class CMsgReader {
     imageBufSize = 0;
   }
 
-  public void readServerInit()
+  public boolean readServerInit()
   {
+    if (!is.checkNoWait(2 + 2 + 16 + 4))
+      return false;
+
+    is.setRestorePoint();
+
     int width = is.readU16();
     int height = is.readU16();
     PixelFormat pf = new PixelFormat();
     pf.read(is);
-    String name = is.readString();
+    int len = is.readU32();
+
+    if (!is.hasDataOrRestore(len))
+      return false;
+    is.clearRestorePoint();
+
+    byte[] nameBytes = new byte[len];
+    is.readBytes(java.nio.ByteBuffer.wrap(nameBytes), len);
+    String name = new String(nameBytes, java.nio.charset.StandardCharsets.UTF_8);
+
     handler.serverInit(width, height, pf, name);
+    return true;
   }
 
-  public void readMsg()
+  public boolean readMsg()
   {
     if (nUpdateRectsLeft == 0) {
-      int type = is.readU8();
+      if (state == MSGSTATE_IDLE) {
+        if (!is.checkNoWait(1))
+          return false;
+        currentMsgType = is.readU8();
+        state = MSGSTATE_MESSAGE;
+      }
 
-      switch (type) {
+      boolean ret;
+      switch (currentMsgType) {
       case MsgTypes.msgTypeSetColourMapEntries:
-        readSetColourMapEntries();
+        ret = readSetColourMapEntries();
         break;
       case MsgTypes.msgTypeBell:
-        readBell();
+        ret = readBell();
         break;
       case MsgTypes.msgTypeServerCutText:
-        readServerCutText();
+        ret = readServerCutText();
         break;
       case MsgTypes.msgTypeFramebufferUpdate:
-        readFramebufferUpdate();
+        ret = readFramebufferUpdate();
         break;
       case MsgTypes.msgTypeServerFence:
-        readFence();
+        ret = readFence();
         break;
       case MsgTypes.msgTypeEndOfContinuousUpdates:
-        readEndOfContinuousUpdates();
+        ret = readEndOfContinuousUpdates();
         break;
       default:
-        vlog.error("Unknown message type "+type);
+        vlog.error("Unknown message type "+currentMsgType);
         throw new Exception("Unknown message type");
       }
-    } else {
-      int x = is.readU16();
-      int y = is.readU16();
-      int w = is.readU16();
-      int h = is.readU16();
-      int encoding = is.readS32();
 
-      switch (encoding) {
+      if (ret)
+        state = MSGSTATE_IDLE;
+      return ret;
+    } else {
+      if (state != MSGSTATE_RECT_DATA) {
+        if (!is.checkNoWait(2 + 2 + 2 + 2 + 4))
+          return false;
+
+        int x = is.readU16();
+        int y = is.readU16();
+        int w = is.readU16();
+        int h = is.readU16();
+
+        // Fresh Rect each time: DecodeManager queues the reference, and
+        // cursor handlers may hand tl through to invokeLater callbacks.
+        dataRect = new Rect(x, y, x+w, y+h);
+        rectEncoding = is.readS32();
+
+        state = MSGSTATE_RECT_DATA;
+      }
+
+      boolean ret;
+
+      switch (rectEncoding) {
       case Encodings.pseudoEncodingLastRect:
         nUpdateRectsLeft = 1;     // this rectangle is the last one
+        ret = true;
         break;
       case Encodings.pseudoEncodingXCursor:
-        readSetXCursor(w, h, new Point(x,y));
+        ret = readSetXCursor(dataRect.width(), dataRect.height(), dataRect.tl);
         break;
       case Encodings.pseudoEncodingCursor:
-        readSetCursor(w, h, new Point(x,y));
+        ret = readSetCursor(dataRect.width(), dataRect.height(), dataRect.tl);
         break;
       case Encodings.pseudoEncodingCursorWithAlpha:
-        readSetCursorWithAlpha(w, h, new Point(x,y));
+        ret = readSetCursorWithAlpha(dataRect.width(), dataRect.height(), dataRect.tl);
         break;
       case Encodings.pseudoEncodingVMwareCursor:
-        readSetVMwareCursor(w, h, new Point(x,y));
+        ret = readSetVMwareCursor(dataRect.width(), dataRect.height(), dataRect.tl);
+        break;
+      case Encodings.pseudoEncodingVMwareCursorPosition:
+        handler.setCursorPos(dataRect.tl);
+        ret = true;
         break;
       case Encodings.pseudoEncodingDesktopName:
-        readSetDesktopName(x, y, w, h);
+        ret = readSetDesktopName(dataRect.tl.x, dataRect.tl.y,
+                                 dataRect.width(), dataRect.height());
         break;
       case Encodings.pseudoEncodingDesktopSize:
-        handler.setDesktopSize(w, h);
+        handler.setDesktopSize(dataRect.width(), dataRect.height());
+        ret = true;
         break;
       case Encodings.pseudoEncodingExtendedDesktopSize:
-        readExtendedDesktopSize(x, y, w, h);
+        ret = readExtendedDesktopSize(dataRect.tl.x, dataRect.tl.y,
+                                      dataRect.width(), dataRect.height());
         break;
       case Encodings.pseudoEncodingClientRedirect:
-        nUpdateRectsLeft = 0;
-        readClientRedirect(x, y, w, h);
-        return;
+        ret = readClientRedirect(dataRect.tl.x, dataRect.tl.y,
+                                 dataRect.width(), dataRect.height());
+        if (ret) {
+          state = MSGSTATE_IDLE;
+          nUpdateRectsLeft = 0;
+        }
+        return ret;
+      case Encodings.pseudoEncodingQEMUKeyEvent:
+        handler.supportsQEMUKeyEvent();
+        ret = true;
+        break;
+      case Encodings.pseudoEncodingLEDState:
+        ret = readLEDState();
+        break;
+      case Encodings.pseudoEncodingVMwareLEDState:
+        ret = readVMwareLEDState();
+        break;
       default:
-        readRect(new Rect(x, y, x+w, y+h), encoding);
+        readRect(dataRect, rectEncoding);
+        ret = true;
         break;
       };
 
+      if (!ret)
+        return false;
+
+      state = MSGSTATE_IDLE;
       nUpdateRectsLeft--;
       if (nUpdateRectsLeft == 0)
         handler.framebufferUpdateEnd();
+      return true;
     }
   }
 
-  protected void readSetColourMapEntries()
+  protected boolean readSetColourMapEntries()
   {
+    if (!is.checkNoWait(1 + 2 + 2))
+      return false;
+
+    is.setRestorePoint();
     is.skip(1);
     int firstColour = is.readU16();
     int nColours = is.readU16();
+
+    if (!is.hasDataOrRestore(nColours * 6))
+      return false;
+    is.clearRestorePoint();
+
     int[] rgbs = new int[nColours * 3];
     for (int i = 0; i < nColours * 3; i++)
       rgbs[i] = is.readU16();
     handler.setColourMapEntries(firstColour, nColours, rgbs);
+    return true;
   }
 
-  protected void readBell()
+  protected boolean readBell()
   {
     handler.bell();
+    return true;
   }
 
-  protected void readServerCutText()
+  protected boolean readServerCutText()
   {
+    if (!is.checkNoWait(3 + 4))
+      return false;
+
+    is.setRestorePoint();
     is.skip(3);
     int len = is.readU32();
 
+    // A negative length signals an extended clipboard message
+    // (pseudoEncodingExtendedClipboard) sharing this same message type,
+    // rather than plain clipboard text.
+    if (len < 0) {
+      int slen = -len;
+      if (readExtendedClipboard(slen)) {
+        is.clearRestorePoint();
+        return true;
+      } else {
+        is.gotoRestorePoint();
+        return false;
+      }
+    }
+
+    if (!is.hasDataOrRestore(len))
+      return false;
+    is.clearRestorePoint();
+
     if (len > 256*1024) {
-      is.skip(len);
       vlog.error("Cut text too long ("+len+" bytes) - ignoring");
-      return;
+      is.skip(len);
+      return true;
     }
 
     ByteBuffer buf = ByteBuffer.allocate(len);
@@ -163,40 +262,155 @@ public class CMsgReader {
     Charset latin1 = Charset.forName("ISO-8859-1");
     CharBuffer chars = latin1.decode(buf.compact());
     handler.serverCutText(chars.toString(), len);
+    return true;
   }
 
-  protected void readFence()
+  protected boolean readExtendedClipboard(int len)
   {
-    int flags;
-    int len;
-    ByteBuffer data = ByteBuffer.allocate(64);
+    if (!is.checkNoWait(len))
+      return false;
 
+    if (len < 4)
+      throw new Exception("Invalid extended clipboard message");
+    if (len > 256*1024) {
+      vlog.error("Cut text too long ("+len+" bytes) - ignoring");
+      is.skip(len);
+      return true;
+    }
+
+    int flags = is.readU32();
+    int action = flags & ClipboardTypes.clipboardActionMask;
+
+    if ((action & ClipboardTypes.clipboardCaps) != 0) {
+      int num = 0;
+      for (int i = 0; i < 16; i++)
+        if ((flags & (1 << i)) != 0)
+          num++;
+
+      if (len < 4 + 4*num)
+        throw new Exception("Invalid extended clipboard message");
+
+      int[] lengths = new int[16];
+      num = 0;
+      for (int i = 0; i < 16; i++)
+        if ((flags & (1 << i)) != 0)
+          lengths[num++] = is.readU32();
+
+      handler.handleClipboardCaps(flags, lengths);
+    } else if (action == ClipboardTypes.clipboardProvide) {
+      // ZlibInStream wraps a native (off-heap) Inflater, which must be
+      // explicitly released -- it isn't freed just by the object being
+      // garbage collected, and letting that happen only via finalization
+      // leaks native memory in proportion to how many Provide messages
+      // are received. deinit() must run on every exit path, including
+      // the "Invalid extended clipboard message" exceptions below, so
+      // this is wrapped in try/finally rather than relying on a single
+      // call at the end of the method.
+      ZlibInStream zis = new ZlibInStream();
+      try {
+        zis.setUnderlying(is, len - 4);
+
+        int[] lengths = new int[16];
+        byte[][] buffers = new byte[16][];
+        int num = 0;
+        for (int i = 0; i < 16; i++) {
+          if ((flags & (1 << i)) == 0)
+            continue;
+
+          if (!zis.checkNoWait(4))
+            throw new Exception("Invalid extended clipboard message");
+
+          int flen = zis.readU32();
+
+          if (flen > 256*1024) {
+            vlog.error("Cut text too long ("+flen+" bytes) - ignoring");
+            while (flen > 0) {
+              if (!zis.checkNoWait(1))
+                throw new Exception("Invalid extended clipboard message");
+              int chunk = zis.getend() - zis.getptr();
+              if (chunk > flen)
+                chunk = flen;
+              zis.skip(chunk);
+              flen -= chunk;
+            }
+            flags &= ~(1 << i);
+            continue;
+          }
+
+          byte[] buf = new byte[flen];
+          zis.readBytes(ByteBuffer.wrap(buf), flen);
+          lengths[num] = flen;
+          buffers[num] = buf;
+          num++;
+        }
+
+        zis.flushUnderlying();
+
+        handler.handleClipboardProvide(flags, lengths, buffers);
+      } finally {
+        zis.deinit();
+      }
+    } else {
+      switch (action) {
+      case ClipboardTypes.clipboardRequest:
+        handler.handleClipboardRequest(flags);
+        break;
+      case ClipboardTypes.clipboardPeek:
+        handler.handleClipboardPeek();
+        break;
+      case ClipboardTypes.clipboardNotify:
+        handler.handleClipboardNotify(flags);
+        break;
+      default:
+        throw new Exception("Invalid extended clipboard message");
+      }
+    }
+
+    return true;
+  }
+
+  protected boolean readFence()
+  {
+    if (!is.checkNoWait(3 + 4 + 1))
+      return false;
+
+    is.setRestorePoint();
     is.skip(3);
 
-    flags = is.readU32();
+    int flags = is.readU32();
+    int len = is.readU8();
 
-    len = is.readU8();
+    if (!is.hasDataOrRestore(len))
+      return false;
+    is.clearRestorePoint();
+
+    ByteBuffer data = ByteBuffer.allocate(64);
     if (len > data.capacity()) {
-      System.out.println("Ignoring fence with too large payload\n");
+      vlog.error("Ignoring fence with too large payload");
       is.skip(len);
-      return;
+      return true;
     }
 
     is.readBytes(data, len);
-
     handler.fence(flags, len, data.array());
+    return true;
   }
 
-  protected void readEndOfContinuousUpdates()
+  protected boolean readEndOfContinuousUpdates()
   {
     handler.endOfContinuousUpdates();
+    return true;
   }
 
-  protected void readFramebufferUpdate()
+  protected boolean readFramebufferUpdate()
   {
+    if (!is.checkNoWait(1 + 2))
+      return false;
+
     is.skip(1);
     nUpdateRectsLeft = is.readU16();
     handler.framebufferUpdateStart();
+    return true;
   }
 
   protected void readRect(Rect r, int encoding)
@@ -214,21 +428,27 @@ public class CMsgReader {
     handler.dataRect(r, encoding);
   }
 
-  protected void readSetXCursor(int width, int height, Point hotspot)
+  protected boolean readSetXCursor(int width, int height, Point hotspot)
   {
+    if (width * height == 0) {
+      handler.setCursor(0, 0, hotspot, new byte[0]);
+      return true;
+    }
+
     byte pr, pg, pb;
     byte sr, sg, sb;
     int data_len = ((width+7)/8) * height;
     int mask_len = ((width+7)/8) * height;
+
+    if (!is.checkNoWait(3 + 3 + data_len + mask_len))
+      return false;
+
     ByteBuffer data = ByteBuffer.allocate(data_len);
     ByteBuffer mask = ByteBuffer.allocate(mask_len);
 
     int x, y;
     byte[] buf = new byte[width*height*4];
     ByteBuffer out;
-
-    if (width * height == 0)
-      return;
 
     pr = (byte)is.readU8();
     pg = (byte)is.readU8();
@@ -269,12 +489,22 @@ public class CMsgReader {
     }
 
     handler.setCursor(width, height, hotspot, buf);
+    return true;
   }
 
-  protected void readSetCursor(int width, int height, Point hotspot)
+  protected boolean readSetCursor(int width, int height, Point hotspot)
   {
+    if (width * height == 0) {
+      handler.setCursor(0, 0, hotspot, new byte[0]);
+      return true;
+    }
+
     int data_len = width * height * (handler.server.pf().bpp/8);
     int mask_len = ((width+7)/8) * height;
+
+    if (!is.checkNoWait(data_len + mask_len))
+      return false;
+
     ByteBuffer data = ByteBuffer.allocate(data_len);
     ByteBuffer mask = ByteBuffer.allocate(mask_len);
 
@@ -308,12 +538,11 @@ public class CMsgReader {
     }
 
     handler.setCursor(width, height, hotspot, buf);
+    return true;
   }
 
-  protected void readSetCursorWithAlpha(int width, int height, Point hotspot)
+  protected boolean readSetCursorWithAlpha(int width, int height, Point hotspot)
   {
-    int encoding;
-
     PixelFormat rgbaPF =
       new PixelFormat(32, 32, false, true, 255, 255, 255, 16, 8, 0);
     ManagedPixelBuffer pb =
@@ -323,12 +552,22 @@ public class CMsgReader {
     ByteBuffer buf =
       ByteBuffer.allocate(pb.area()*4).order(rgbaPF.getByteOrder());;
 
-    encoding = is.readS32();
+    // The decoder may use restore points internally, so track the
+    // encoding across calls instead.
+    if (cursorEncoding == -1) {
+      if (!is.checkNoWait(4))
+        return false;
+      cursorEncoding = is.readS32();
+    }
 
     origPF = handler.server.pf();
     handler.server.setPF(rgbaPF);
-    handler.readAndDecodeRect(pb.getRect(), encoding, pb);
-    handler.server.setPF(origPF);
+    try {
+      handler.readAndDecodeRect(pb.getRect(), cursorEncoding, pb);
+    } finally {
+      handler.server.setPF(origPF);
+    }
+    cursorEncoding = -1;
 
     // ARGB with pre-multiplied alpha works best for BufferedImage
     if (pb.area() > 0) {
@@ -350,9 +589,10 @@ public class CMsgReader {
     }
 
     handler.setCursor(width, height, hotspot, buf.array());
+    return true;
   }
 
-  protected void readSetVMwareCursor(int width, int height, Point hotspot)
+  protected boolean readSetVMwareCursor(int width, int height, Point hotspot)
   {
     // VMware cursor sends RGBA, java BufferedImage needs ARGB
     if (width > maxCursorSize || height > maxCursorSize)
@@ -360,11 +600,21 @@ public class CMsgReader {
 
     byte type;
 
+    if (!is.checkNoWait(1 + 1))
+      return false;
+
+    is.setRestorePoint();
+
     type = (byte)is.readU8();
     is.skip(1);
 
     if (type == 0) {
       int len = width * height * (handler.server.pf().bpp/8);
+
+      if (!is.hasDataOrRestore(len + len))
+        return false;
+      is.clearRestorePoint();
+
       ByteBuffer andMask = ByteBuffer.allocate(len);
       ByteBuffer xorMask = ByteBuffer.allocate(len);
 
@@ -432,6 +682,10 @@ public class CMsgReader {
 
       handler.setCursor(width, height, hotspot, data.array());
     } else if (type == 1) {
+      if (!is.hasDataOrRestore(width*height*4))
+        return false;
+      is.clearRestorePoint();
+
       ByteBuffer data = ByteBuffer.allocate(width*height*4);
 
       // FIXME: Is alpha premultiplied?
@@ -445,13 +699,27 @@ public class CMsgReader {
 
       handler.setCursor(width, height, hotspot, data.array());
     } else {
+      is.clearRestorePoint();
       throw new Exception("Unknown cursor type");
     }
+    return true;
   }
 
-  protected void readSetDesktopName(int x, int y, int w, int h)
+  protected boolean readSetDesktopName(int x, int y, int w, int h)
   {
-    String name = is.readString();
+    if (!is.checkNoWait(4))
+      return false;
+
+    is.setRestorePoint();
+    int len = is.readU32();
+
+    if (!is.hasDataOrRestore(len))
+      return false;
+    is.clearRestorePoint();
+
+    byte[] nameBytes = new byte[len];
+    is.readBytes(ByteBuffer.wrap(nameBytes), len);
+    String name = new String(nameBytes, java.nio.charset.StandardCharsets.UTF_8);
 
     if (x != 0 || y != 0 || w != 0 || h != 0) {
       vlog.error("Ignoring DesktopName rect with non-zero position/size");
@@ -459,17 +727,46 @@ public class CMsgReader {
       handler.setName(name);
     }
 
+    return true;
   }
 
-  protected void readExtendedDesktopSize(int x, int y, int w, int h)
+  protected boolean readLEDState()
+  {
+    if (!is.checkNoWait(1))
+      return false;
+    int ledState = is.readU8();
+    handler.setLEDState(ledState);
+    return true;
+  }
+
+  protected boolean readVMwareLEDState()
+  {
+    if (!is.checkNoWait(4))
+      return false;
+    // As luck has it, this extension uses the same bit definitions,
+    // so no conversion required.
+    int ledState = is.readU32();
+    handler.setLEDState(ledState);
+    return true;
+  }
+
+  protected boolean readExtendedDesktopSize(int x, int y, int w, int h)
   {
     int screens, i;
     int id, flags;
     int sx, sy, sw, sh;
     ScreenSet layout = new ScreenSet();
 
+    if (!is.checkNoWait(1 + 3))
+      return false;
+
+    is.setRestorePoint();
     screens = is.readU8();
     is.skip(3);
+
+    if (!is.hasDataOrRestore(16 * screens))
+      return false;
+    is.clearRestorePoint();
 
     for (i = 0;i < screens;i++) {
       id = is.readU32();
@@ -483,18 +780,40 @@ public class CMsgReader {
     }
 
     handler.setExtendedDesktopSize(x, y, w, h, layout);
+    return true;
   }
 
-  protected void readClientRedirect(int x, int y, int w, int h)
+  protected boolean readClientRedirect(int x, int y, int w, int h)
   {
+    if (!is.checkNoWait(2 + 4))
+      return false;
+
+    is.setRestorePoint();
     int port = is.readU16();
-    String host = is.readString();
-    String x509subject = is.readString();
+    int hostLen = is.readU32();
+
+    if (!is.hasDataOrRestore(hostLen + 4))
+      return false;
+
+    byte[] hostBytes = new byte[hostLen];
+    is.readBytes(ByteBuffer.wrap(hostBytes), hostLen);
+    int subjLen = is.readU32();
+
+    if (!is.hasDataOrRestore(subjLen))
+      return false;
+    is.clearRestorePoint();
+
+    byte[] subjBytes = new byte[subjLen];
+    is.readBytes(ByteBuffer.wrap(subjBytes), subjLen);
+
+    String host = new String(hostBytes, java.nio.charset.StandardCharsets.UTF_8);
+    String x509subject = new String(subjBytes, java.nio.charset.StandardCharsets.UTF_8);
 
     if (x != 0 || y != 0 || w != 0 || h != 0)
       vlog.error("Ignoring ClientRedirect rect with non-zero position/size");
     else
       handler.clientRedirect(port, host, x509subject);
+    return true;
   }
 
   public int[] getImageBuf(int required) { return getImageBuf(required, 0, 0); }
@@ -522,9 +841,18 @@ public class CMsgReader {
 
   public int imageBufIdealSize;
 
+  private static final int MSGSTATE_IDLE = 0;
+  private static final int MSGSTATE_MESSAGE = 1;
+  private static final int MSGSTATE_RECT_DATA = 2;
+
   protected CMsgHandler handler;
   protected InStream is;
+  protected int state = MSGSTATE_IDLE;
+  protected int currentMsgType;
   protected int nUpdateRectsLeft;
+  protected Rect dataRect;
+  protected int rectEncoding;
+  protected int cursorEncoding = -1;
   protected final int maxCursorSize = 256;
   protected int[] imageBuf;
   protected int imageBufSize;

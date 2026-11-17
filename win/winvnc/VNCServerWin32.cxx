@@ -22,12 +22,13 @@
 #include <config.h>
 #endif
 
-#include <winvnc/VNCServerWin32.h>
-#include <winvnc/resource.h>
-#include <winvnc/ListConnInfo.h>
-#include <winvnc/STrayIcon.h>
+#include "VNCServerWin32.h"
+#include "resource.h"
+#include "ListConnInfo.h"
+#include "STrayIcon.h"
 
 #include <core/LogWriter.h>
+#include <core/i18n.h>
 
 #include <network/TcpSocket.h>
 
@@ -50,16 +51,19 @@ const char* winvnc::VNCServerWin32::RegConfigPath = "Software\\TigerVNC\\WinVNC4
 
 
 static IntParameter port_number("PortNumber",
-  "TCP/IP port on which the server will accept connections",
+  _("TCP port to listen for RFB protocol"),
   5900, 0, 65535);
 static StringParameter hosts("Hosts",
-  "Filter describing which hosts are allowed access to this server", "+");
+  _("Filter describing which hosts are allowed access to this server"),
+  "+");
 static BoolParameter localHost("LocalHost",
-  "Only accept connections from via the local loop-back network interface", false);
+  _("Only allow connections from localhost"),
+  false);
 static BoolParameter queryOnlyIfLoggedOn("QueryOnlyIfLoggedOn",
-  "Only prompt for a local user to accept incoming connections if there is a user logged on", false);
+  _("Only prompt for a local user to accept incoming connections if there is a user logged on"),
+  false);
 static BoolParameter showTrayIcon("ShowTrayIcon",
-  "Show the configuration applet in the system tray icon", true);
+  _("Show the configuration applet in the system tray"), true);
 
 
 VNCServerWin32::VNCServerWin32()
@@ -103,16 +107,16 @@ void VNCServerWin32::processAddressChange() {
     return;
 
   // Tool-tip prefix depends on server mode
-  const char* prefix = "VNC server (user):";
+  const char* prefix = _("VNC server (user):");
   if (isServiceProcess())
-    prefix = "VNC server (service):";
+    prefix = _("VNC server (service):");
 
   // Fetch the list of addresses
   std::list<std::string> addrs;
   if (rfbSock.isListening())
     addrs = TcpListener::getMyAddresses();
   else
-    addrs.push_front("Not accepting connections");
+    addrs.push_front(_("Not accepting connections"));
 
   // Build the new tip
   std::list<std::string>::iterator i, next_i;
@@ -125,7 +129,7 @@ void VNCServerWin32::processAddressChange() {
   }
   
   // Pass the new tip to the tray icon
-  vlog.info("Refreshing tray icon");
+  vlog.info(_("Refreshing system tray icon"));
   trayIcon->setToolTip(toolTip.c_str());
 }
 
@@ -235,18 +239,17 @@ bool VNCServerWin32::setClientsStatus(ListConnInfo* LCInfo) {
   return queueCommand(SetClientsStatus, LCInfo, 0);
 }
 
-void VNCServerWin32::queryConnection(network::Socket* sock,
-                                     const char* userName)
+void VNCServerWin32::queryConnection(rfb::SConnection* conn)
 {
   if (queryOnlyIfLoggedOn && CurrentUserToken().noUserLoggedOn()) {
-    vncServer.approveConnection(sock, true, nullptr);
+    vncServer.approveConnection(conn, true, nullptr);
     return;
   }
   if (queryConnectDialog) {
-    vncServer.approveConnection(sock, false, "Another connection is currently being queried.");
+    vncServer.approveConnection(conn, false, _("Another connection is currently being queried."));
     return;
   }
-  queryConnectDialog = new QueryConnectDialog(sock, userName, this);
+  queryConnectDialog = new QueryConnectDialog(conn, this);
   queryConnectDialog->startDialog();
 }
 
@@ -304,15 +307,15 @@ void VNCServerWin32::processEvent(HANDLE event_) {
     case QueryConnectionComplete:
       // The Accept/Reject dialog has completed
       // Get the result, then clean it up
-      vncServer.approveConnection(queryConnectDialog->getSock(),
+      vncServer.approveConnection(queryConnectDialog->getConn(),
                                   queryConnectDialog->isAccepted(),
-                                  "Connection rejected by user");
+                                  _("Connection rejected by local user"));
       delete queryConnectDialog;
       queryConnectDialog = nullptr;
       break;
 
     default:
-      vlog.error("Unknown command %d queued", command);
+      vlog.error(_("Unknown command %d queued"), command);
     };
 
     // Clear the command and signal completion

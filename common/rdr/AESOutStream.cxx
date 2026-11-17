@@ -24,9 +24,14 @@
 
 #include <stdexcept>
 
+#include <core/i18n.h>
+
 #include <rdr/AESOutStream.h>
 
 #ifdef HAVE_NETTLE
+
+#include <nettle/version.h>
+
 using namespace rdr;
 
 const int MaxMessageSize = 8192;
@@ -41,7 +46,7 @@ AESOutStream::AESOutStream(OutStream* _out, const uint8_t* key,
   else if (keySize == 256)
     EAX_SET_KEY(&eaxCtx256, aes256_set_encrypt_key, aes256_encrypt, key);
   else
-    throw std::out_of_range("Incorrect key size");
+    throw std::out_of_range("Invalid key size");
 }
 
 AESOutStream::~AESOutStream()
@@ -83,14 +88,22 @@ void AESOutStream::writeMessage(const uint8_t* data, size_t length)
     EAX_SET_NONCE(&eaxCtx128, aes128_encrypt, 16, counter);
     EAX_UPDATE(&eaxCtx128, aes128_encrypt, 2, msg);
     EAX_ENCRYPT(&eaxCtx128, aes128_encrypt, length, msg + 2, data);
-    EAX_DIGEST(&eaxCtx128, aes128_encrypt, 16, msg + 2 + length);
+#if NETTLE_VERSION_MAJOR >= 4
+    EAX_DIGEST(&eaxCtx128, aes128_encrypt, msg + 2 + length);
+#else
+    EAX_DIGEST(&eaxCtx128, aes128_encrypt, EAX_DIGEST_SIZE, msg + 2 + length);
+#endif
   } else {
     EAX_SET_NONCE(&eaxCtx256, aes256_encrypt, 16, counter);
     EAX_UPDATE(&eaxCtx256, aes256_encrypt, 2, msg);
     EAX_ENCRYPT(&eaxCtx256, aes256_encrypt, length, msg + 2, data);
-    EAX_DIGEST(&eaxCtx256, aes256_encrypt, 16, msg + 2 + length);
+#if NETTLE_VERSION_MAJOR >= 4
+    EAX_DIGEST(&eaxCtx256, aes256_encrypt, msg + 2 + length);
+#else
+    EAX_DIGEST(&eaxCtx256, aes256_encrypt, EAX_DIGEST_SIZE, msg + 2 + length);
+#endif
   }
-  out->writeBytes(msg, 2 + length + 16);
+  out->writeBytes(msg, 2 + length + EAX_DIGEST_SIZE);
   out->flush();
 
   // Update nonce by incrementing the counter as a

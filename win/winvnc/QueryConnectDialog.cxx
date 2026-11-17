@@ -20,11 +20,14 @@
 #include <config.h>
 #endif
 
-#include <winvnc/VNCServerWin32.h>
-#include <winvnc/QueryConnectDialog.h>
-#include <winvnc/resource.h>
+#include "VNCServerWin32.h"
+#include "QueryConnectDialog.h"
+#include "resource.h"
 
 #include <core/LogWriter.h>
+#include <core/i18n.h>
+
+#include <rfb/SConnection.h>
 
 #include <rfb_win32/Win32Util.h>
 #include <rfb_win32/Service.h>
@@ -37,20 +40,18 @@ using namespace winvnc;
 static LogWriter vlog("QueryConnectDialog");
 
 static IntParameter timeout("QueryConnectTimeout",
-                            "Number of seconds to show the Accept connection dialog before "
-                            "rejecting the connection",
+                            _("Number of seconds to show the 'Accept "
+                              "connection' dialog before rejecting the "
+                              "connection"),
                             10, 0, INT_MAX);
 
 
 // - Visible methods
 
-QueryConnectDialog::QueryConnectDialog(network::Socket* sock_,
-                                       const char* userName_,
+QueryConnectDialog::QueryConnectDialog(rfb::SConnection* conn_,
                                        VNCServerWin32* s)
 : Dialog(GetModuleHandle(nullptr)),
-  thread(nullptr), sock(sock_), peerIp(sock->getPeerAddress()),
-  userName(userName_?userName_:""),
-  approve(false), server(s) {
+  thread(nullptr), conn(conn_), approve(false), server(s) {
 }
 
 QueryConnectDialog::~QueryConnectDialog()
@@ -72,7 +73,7 @@ void QueryConnectDialog::worker() {
   countdown = timeout;
   try {
     if (desktopChangeRequired() && !changeDesktop())
-      throw std::runtime_error("changeDesktop failed");
+      throw std::runtime_error(_("Failed to change to active desktop"));
     approve = Dialog::showDialog(MAKEINTRESOURCE(IDD_QUERY_CONNECT));
     server->queryConnectionComplete();
   } catch (...) {
@@ -85,12 +86,14 @@ void QueryConnectDialog::worker() {
 // - Dialog overrides
 
 void QueryConnectDialog::initDialog() {
+  const char* userName;
   if (!SetTimer(handle, 1, 1000, nullptr))
     throw core::win32_error("SetTimer", GetLastError());
-  setItemString(IDC_QUERY_HOST, peerIp.c_str());
-  if (userName.empty())
-    userName = "(anonymous)";
-  setItemString(IDC_QUERY_USER, userName.c_str());
+  setItemString(IDC_QUERY_HOST, conn->getSock()->getPeerAddress());
+  userName = conn->getUserName();
+  if (userName[0] == '\0')
+    userName = _("(anonymous)");
+  setItemString(IDC_QUERY_USER, userName);
   setCountdownLabel();
 }
 

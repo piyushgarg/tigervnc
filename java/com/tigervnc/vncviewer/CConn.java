@@ -1,7 +1,7 @@
 /* Copyright (C) 2002-2005 RealVNC Ltd.  All Rights Reserved.
  * Copyright 2009-2013 Pierre Ossman <ossman@cendio.se> for Cendio AB
  * Copyright (C) 2011-2013 D. R. Commander.  All Rights Reserved.
- * Copyright (C) 2011-2019 Brian P. Hinz
+ * Copyright (C) 2011-2026 Brian P. Hinz
  *
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -35,9 +35,9 @@
 package com.tigervnc.vncviewer;
 
 import java.awt.*;
-import java.awt.datatransfer.StringSelection;
 import java.awt.event.*;
 import java.awt.Toolkit;
+import java.nio.channels.SelectableChannel;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -51,6 +51,8 @@ import javax.swing.ImageIcon;
 import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.prefs.*;
 
 import com.tigervnc.rdr.*;
@@ -59,10 +61,13 @@ import com.tigervnc.rfb.Point;
 import com.tigervnc.rfb.Exception;
 import com.tigervnc.network.Socket;
 import com.tigervnc.network.TcpSocket;
+import com.tigervnc.network.UnixSocket;
+
+import com.jcraft.jsch.Session;
 
 import static com.tigervnc.vncviewer.Parameters.*;
 
-public class CConn extends CConnection implements 
+public final class CConn extends CConnection implements 
   FdInStreamBlockCallback, ActionListener {
 
   // 8 colours (1 bit per component)
@@ -92,6 +97,7 @@ public class CConn extends CConnection implements
     server.supportsLocalCursor = true;
     server.supportsDesktopResize = true;
     server.supportsClientRedirect = true;
+    server.supportsLEDState = true;
 
     if (customCompressLevel.getValue())
       setCompressLevel(compressLevel.getValue());
@@ -100,8 +106,25 @@ public class CConn extends CConnection implements
       setQualityLevel(qualityLevel.getValue());
 
     if (sock == null) {
-      setServerName(Hostname.getHost(vncServerName));
-      setServerPort(Hostname.getPort(vncServerName));
+      boolean isUnixSocket = Hostname.isUnixSocket(vncServerName);
+      if (isUnixSocket) {
+        setServerName(Hostname.getHost(vncServerName));
+        setServerPort(0);
+      } else {
+        setServerName(Hostname.getHost(vncServerName));
+        setServerPort(Hostname.getPort(vncServerName));
+      }
+      // A "host:/path" connection string only makes sense via an SSH
+      // tunnel (there's no local path to connect to otherwise), so treat
+      // it as an implicit request to tunnel rather than failing if the
+      // user forgot to also check/pass -tunnel or -via.
+      if (isUnixSocket && !vncServerName.startsWith("/") &&
+          !tunnel.getValue() && via.getValue().isEmpty()) {
+        vlog.info("Automatically enabling SSH tunnel for Unix domain socket \""+
+                  vncServerName+"\"");
+        tunnel.setParam(true);
+      }
+
       try {
         if (tunnel.getValue() || !via.getValue().isEmpty()) {
           int localPort = TcpSocket.findFreeTcpPort();
@@ -109,14 +132,32 @@ public class CConn extends CConnection implements
             throw new Exception("Could not obtain free TCP port");
           String gatewayHost = Tunnel.getSshHost();
           if (gatewayHost.isEmpty())
-            gatewayHost = getServerName();
-          Tunnel.createTunnel(gatewayHost, getServerName(),
-                              getServerPort(), localPort);
+            gatewayHost = (isUnixSocket ? (vncServerName.startsWith("/") ? "localhost" : Hostname.getHost(vncServerName)) : getServerName());
+
+          String remoteTarget = isUnixSocket ? Hostname.getSocketPath(vncServerName) : getServerName();
+          tunnelSession = Tunnel.createTunnel(gatewayHost, remoteTarget,
+                                              getServerPort(), localPort);
           sock = new TcpSocket("localhost", localPort);
-          vlog.info("Connected to localhost port "+localPort);
+          if (isUnixSocket)
+            vlog.info("Connected to localhost port "+localPort+" (tunneled to Unix domain socket "+remoteTarget+")");
+          else
+            vlog.info("Connected to localhost port "+localPort);
         } else {
-          sock = new TcpSocket(getServerName(), getServerPort());
-          vlog.info("Connected to host "+getServerName()+" port "+getServerPort());
+          if (isUnixSocket) {
+            // A bare path with no tunnel/via requested is a local (or
+            // already-forwarded, e.g. via a manually-run "ssh -L") Unix
+            // domain socket: connect to it directly, same as the C++
+            // viewer. A "host:/path" form has no local path to connect
+            // to without a tunnel, so that still requires -tunnel/-via.
+            if (!vncServerName.startsWith("/"))
+              throw new Exception("Connecting to a remote Unix domain socket directly is only supported via SSH tunnel (-via or -tunnel)");
+            String path = Hostname.getSocketPath(vncServerName);
+            sock = new UnixSocket(path);
+            vlog.info("Connected to Unix domain socket "+path);
+          } else {
+            sock = new TcpSocket(getServerName(), getServerPort());
+            vlog.info("Connected to host "+getServerName()+" port "+getServerPort());
+          }
         }
       } catch (java.lang.Exception e) {
         throw new Exception(e.getMessage());
@@ -137,6 +178,15 @@ public class CConn extends CConnection implements
     initialiseProtocol();
 
     OptionsDialog.addCallback("handleOptions", this);
+
+    int when = Fl.READ | Fl.EXCEPT;
+    if (sock != null && sock.outStream() != null && sock.outStream().hasBufferedData())
+      when |= Fl.WRITE;
+
+    if (sock != null && sock.getChannel() != null) {
+      Fl.add_fd(sock.getChannel(), when, CConn::socketEvent, this);
+      processNextMsg();
+    }
   }
 
   public String connectionInfo() {
@@ -204,15 +254,29 @@ public class CConn extends CConnection implements
 
     serverPF = server.pf();
 
-    desktop = new DesktopWindow(server.width(), server.height(),
-                                server.name(), serverPF, this);
+    if (javax.swing.SwingUtilities.isEventDispatchThread()) {
+      desktop = new DesktopWindow(server.width(), server.height(),
+                                  server.name(), serverPF, this);
+    } else {
+      try {
+        javax.swing.SwingUtilities.invokeAndWait(new Runnable() {
+          public void run() {
+            desktop = new DesktopWindow(server.width(), server.height(),
+                                        server.name(), serverPF, CConn.this);
+          }
+        });
+      } catch (java.lang.Exception e) {
+        desktop = new DesktopWindow(server.width(), server.height(),
+                                    server.name(), serverPF, this);
+      }
+    }
     fullColorPF = desktop.getPreferredPF();
 
     // Force a switch to the format and encoding we'd like
-    updatePixelFormat();
     int encNum = Encodings.encodingNum(preferredEncoding.getValue());
     if (encNum != -1)
       setPreferredEncoding(encNum);
+    updatePixelFormat();
   }
 
   // setDesktopSize() is called when the desktop size changes (including when
@@ -242,6 +306,8 @@ public class CConn extends CConnection implements
   public void clientRedirect(int port, String host, String x509subject)
   {
     try {
+      if (sock != null && sock.getChannel() != null)
+        Fl.remove_fd(sock.getChannel());
       sock.close();
       sock = new TcpSocket(host, port);
       vlog.info("Redirected to "+host+":"+port);
@@ -249,9 +315,21 @@ public class CConn extends CConnection implements
       setServerPort(port);
       sock.inStream().setBlockCallback(this);
       setStreams(sock.inStream(), sock.outStream());
-      if (desktop != null)
+      csecurity = null;
+      if (desktop != null) {
         desktop.dispose();
+        desktop = null;
+      }
       initialiseProtocol();
+
+      int when = Fl.READ | Fl.EXCEPT;
+      if (sock != null && sock.outStream() != null && sock.outStream().hasBufferedData())
+        when |= Fl.WRITE;
+
+      if (sock != null && sock.getChannel() != null) {
+        Fl.add_fd(sock.getChannel(), when, CConn::socketEvent, this);
+        processNextMsg();
+      }
     } catch (java.lang.Exception e) {
       throw new Exception(e.getMessage());
     }
@@ -265,15 +343,26 @@ public class CConn extends CConnection implements
       desktop.setName(name);
   }
 
+  private javax.swing.Timer updateTimeoutTimer = null;
+
+  public void handleUpdateTimeout() {
+    if (desktop != null)
+      desktop.updateWindow();
+  }
+
   // framebufferUpdateStart() is called at the beginning of an update.
   // Here we try to send out a new framebuffer update request so that the
   // next update can be sent out in parallel with us decoding the current
   // one.
   public void framebufferUpdateStart()
   {
-
     super.framebufferUpdateStart();
 
+    if (updateTimeoutTimer == null) {
+      updateTimeoutTimer = new javax.swing.Timer(1000, (e) -> handleUpdateTimeout());
+      updateTimeoutTimer.setRepeats(true);
+    }
+    updateTimeoutTimer.restart();
   }
 
   // framebufferUpdateEnd() is called at the end of an update.
@@ -282,11 +371,16 @@ public class CConn extends CConnection implements
   // appropriately, and then request another incremental update.
   public void framebufferUpdateEnd()
   {
+    if (updateTimeoutTimer != null) {
+      updateTimeoutTimer.stop();
+    }
+
     super.framebufferUpdateEnd();
 
     updateCount++;
 
-    desktop.updateWindow();
+    if (desktop != null)
+      desktop.updateWindow();
 
     // Compute new settings based on updated bandwidth values
     if (autoSelect.getValue())
@@ -306,14 +400,32 @@ public class CConn extends CConnection implements
       desktop.getToolkit().beep();
   }
 
-  public void serverCutText(String str, int len)
+  public void handleClipboardData(String data)
   {
-    StringSelection buffer;
-
     if (!acceptClipboard.getValue())
       return;
 
-    ClipboardDialog.serverCutText(str);
+    ClipboardDialog.serverCutText(data);
+  }
+
+  public void handleClipboardAnnounce(boolean available)
+  {
+    if (available && acceptClipboard.getValue())
+      requestClipboard();
+  }
+
+  public void handleClipboardRequest()
+  {
+    final String data = ClipboardDialog.getText();
+    clipboardSender.execute(() -> {
+      try {
+        if ((state() != stateEnum.RFBSTATE_NORMAL) || shuttingDown)
+          return;
+        sendClipboardData(data);
+      } catch (java.lang.Exception e) {
+        vlog.error("Failed to send clipboard data: " + e.getMessage());
+      }
+    });
   }
 
   public void dataRect(Rect r, int encoding)
@@ -334,6 +446,14 @@ public class CConn extends CConnection implements
                         byte[] data)
   {
     desktop.setCursor(width, height, hotspot, data);
+  }
+
+  public void setLEDState(int state)
+  {
+    // can't call super.super.setLEDState(state);
+    server.setLEDState(state);
+
+    desktop.viewport.setLEDState(state);
   }
 
   public void fence(int flags, int len, byte[] data)
@@ -481,6 +601,15 @@ public class CConn extends CConnection implements
 
   // close() shuts down the socket, thus waking up the RFB thread.
   public void close() {
+    synchronized (closeLock) {
+      if (closed)
+        return;
+      closed = true;
+    }
+    if (updateTimeoutTimer != null) {
+      updateTimeoutTimer.stop();
+      updateTimeoutTimer = null;
+    }
     if (closeListener != null) {
       JFrame f =
         (JFrame)SwingUtilities.getAncestorOfClass(JFrame.class, desktop);
@@ -488,19 +617,40 @@ public class CConn extends CConnection implements
         f.dispatchEvent(new WindowEvent(f, WindowEvent.WINDOW_CLOSING));
     }
     shuttingDown = true;
+    clipboardSender.shutdownNow();
+    super.close();
     try {
-      if (sock != null)
+      if (sock != null) {
         sock.shutdown();
+        sock = null;
+      }
     } catch (java.lang.Exception e) {
       throw new Exception(e.getMessage());
     }
+    OptionsDialog.removeCallback(this);
+    if (desktop != null) {
+      OptionsDialog.removeCallback(desktop);
+      if (desktop.viewport != null)
+        OptionsDialog.removeCallback(desktop.viewport);
+      desktop.dispose();
+      desktop = null;
+    }
+    Tunnel.closeTunnel(tunnelSession);
+    tunnelSession = null;
   }
 
-  // writeClientCutText() is called from the clipboard dialog
+  // Go through announceClipboard() so the server gets a Notify first;
+  // Xvnc drops a Provide from a client that hasn't announced.
   public void writeClientCutText(String str, int len) {
-    if ((state() != stateEnum.RFBSTATE_NORMAL) || shuttingDown)
-      return;
-    writer().writeClientCutText(str, len);
+    clipboardSender.execute(() -> {
+      try {
+        if ((state() != stateEnum.RFBSTATE_NORMAL) || shuttingDown)
+          return;
+        announceClipboard(true);
+      } catch (java.lang.Exception e) {
+        vlog.error("Failed to announce clipboard data: " + e.getMessage());
+      }
+    });
   }
 
   public void actionPerformed(ActionEvent e) {}
@@ -533,6 +683,15 @@ public class CConn extends CConnection implements
   private String serverHost;
   private int serverPort;
   private Socket sock;
+  private Session tunnelSession;
+  private final Object closeLock = new Object();
+  private boolean closed = false;
+  private final ExecutorService clipboardSender =
+    Executors.newSingleThreadExecutor(r -> {
+      Thread t = new Thread(r, "Clipboard Sender");
+      t.setDaemon(true);
+      return t;
+    });
 
   protected DesktopWindow desktop;
 
@@ -543,6 +702,49 @@ public class CConn extends CConnection implements
   private PixelFormat fullColorPF;
 
   private int lastServerEncoding;
+
+  public static void socketEvent(SelectableChannel channel, int mask, Object cbdata)
+  {
+    CConn cc = (CConn)cbdata;
+    Fl.remove_fd(channel);
+    cc.processNextMsg();
+  }
+
+  public void processNextMsg()
+  {
+    int when;
+
+    try {
+      if (sock != null && sock.outStream() != null) {
+        synchronized (sock.outStream()) {
+          sock.outStream().flush();
+        }
+      }
+
+      do {
+        if (!processMsg())
+          break;
+      } while (sock != null && sock.inStream() != null && sock.inStream().checkNoWait(1));
+    } catch (com.tigervnc.rdr.TimedOut e) {
+      // Non-fatal socket timeout while waiting for remaining bytes
+    } catch (com.tigervnc.rdr.EndOfStream e) {
+      vlog.info("Server disconnected: " + e.getMessage());
+      close();
+      return;
+    } catch (java.lang.Exception e) {
+      vlog.error("Error in processNextMsg: " + e.getMessage());
+      e.printStackTrace();
+      close();
+      return;
+    }
+
+    when = Fl.READ | Fl.EXCEPT;
+    if (sock != null && sock.outStream() != null && sock.outStream().hasBufferedData())
+      when |= Fl.WRITE;
+
+    if (sock != null && sock.getChannel() != null)
+      Fl.add_fd(sock.getChannel(), when, CConn::socketEvent, this);
+  }
 
   public ActionListener closeListener = null;
 

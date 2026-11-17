@@ -1,6 +1,6 @@
 /* Copyright (C) 2002-2005 RealVNC Ltd.  All Rights Reserved.
  * Copyright (C) 2011 D. R. Commander.  All Rights Reserved.
- * Copyright (C) 2012-2019 Brian P. Hinz
+ * Copyright (C) 2012-2026 Brian P. Hinz
  *
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -45,8 +45,12 @@ public class ServerParams {
     supportsSetDesktopSize = false; supportsFence = false;
     supportsContinuousUpdates = false;
     supportsClientRedirect = false;
+    supportsQEMUKeyEvent = false;
+    supportsLEDState = false;
     compressLevel = 6; qualityLevel = -1; fineQualityLevel = -1;
     subsampling = subsampleUndefined; name_ = null; verStrPos = 0;
+    clipFlags = 0; clipSizes = new int[16];
+    ledState_ = LedStates.ledUnknown;
 
     encodings_ = new ArrayList();
     screenLayout_ = new ScreenSet();
@@ -102,7 +106,7 @@ public class ServerParams {
   }
 
   public String name() { return name_; }
-  public void setName(String name)
+  public final void setName(String name)
   {
     name_ = name;
   }
@@ -201,6 +205,28 @@ public class ServerParams {
     }
   }
 
+  public int clipboardFlags() { return clipFlags; }
+
+  public int clipboardSize(int format) {
+    for (int i = 0; i < 16; i++)
+      if ((1 << i) == format)
+        return clipSizes[i];
+    throw new Exception(String.format("Invalid clipboard format 0x%x", format));
+  }
+
+  public void setClipboardCaps(int flags, int[] lengths) {
+    clipFlags = flags;
+    int num = 0;
+    for (int i = 0; i < 16; i++) {
+      if ((flags & (1 << i)) == 0)
+        continue;
+      clipSizes[i] = lengths[num++];
+    }
+  }
+
+  public int ledState() { return ledState_; }
+  public void setLEDState(int state) { ledState_ = state; }
+
   public boolean useCopyRect;
 
   public boolean supportsLocalCursor;
@@ -211,6 +237,8 @@ public class ServerParams {
   public boolean supportsDesktopRename;
   public boolean supportsLastRect;
   public boolean supportsClientRedirect;
+  public boolean supportsQEMUKeyEvent;
+  public boolean supportsLEDState;
 
   public boolean supportsSetDesktopSize;
   public boolean supportsFence;
@@ -231,4 +259,9 @@ public class ServerParams {
   private ArrayList encodings_;
   private StringBuilder verStr;
   private int verStrPos;
+
+  private int clipFlags;
+  private int[] clipSizes;
+
+  private int ledState_;
 }

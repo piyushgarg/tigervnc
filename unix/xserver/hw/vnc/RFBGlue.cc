@@ -17,9 +17,7 @@
  * USA.
  */
 
-#ifdef HAVE_CONFIG_H
 #include <config.h>
-#endif
 
 #include <stdlib.h>
 #include <string.h>
@@ -29,10 +27,13 @@
 #include <core/Logger_syslog.h>
 #include <core/LogWriter.h>
 #include <core/string.h>
+#include <core/i18n.h>
 
 #include <network/TcpSocket.h>
 
+#ifdef HAVE_PAM
 #include <rfb/UnixPasswordValidator.h>
+#endif
 
 #include "RFBGlue.h"
 
@@ -56,18 +57,6 @@ void vncLogError(const char *name, const char *format, ...)
     return;
   va_start(ap, format);
   vlog->verror(format, ap);
-  va_end(ap);
-}
-
-void vncLogStatus(const char *name, const char *format, ...)
-{
-  core::LogWriter* vlog;
-  va_list ap;
-  vlog = core::LogWriter::getLogWriter(name);
-  if (vlog == nullptr)
-    return;
-  va_start(ap, format);
-  vlog->vstatus(format, ap);
   va_end(ap);
 }
 
@@ -100,7 +89,7 @@ int vncSetParam(const char *name, const char *value)
   if (value != nullptr)
     return core::Configuration::setParam(name, value);
   else {
-    core::VoidParameter* param;
+    core::Parameter* param;
     param = core::Configuration::getParam(name);
     if (param == nullptr)
       return false;
@@ -110,7 +99,7 @@ int vncSetParam(const char *name, const char *value)
 
 char* vncGetParam(const char *name)
 {
-  core::VoidParameter* param;
+  core::Parameter* param;
 
   // Hack to avoid exposing password!
   if (strcasecmp(name, "Password") == 0)
@@ -125,7 +114,7 @@ char* vncGetParam(const char *name)
 
 const char* vncGetParamDesc(const char *name)
 {
-  core::VoidParameter* param;
+  core::Parameter* param;
 
   param = core::Configuration::getParam(name);
   if (param == nullptr)
@@ -146,7 +135,7 @@ char *vncGetParamList(void)
 
   len = 0;
 
-  for (core::VoidParameter *param: *core::Configuration::global()) {
+  for (core::Parameter *param: *core::Configuration::global()) {
     int l = strlen(param->getName());
     if (l <= 255)
       len += l + 1;
@@ -157,7 +146,7 @@ char *vncGetParamList(void)
     return nullptr;
 
   ptr = data;
-  for (core::VoidParameter *param: *core::Configuration::global()) {
+  for (core::Parameter *param: *core::Configuration::global()) {
     int l = strlen(param->getName());
     if (l <= 255) {
       *ptr++ = l;
@@ -201,6 +190,11 @@ int vncIsTCPPortUsed(int port)
   return 0;
 }
 
+const char* vncGettext(const char* msgid)
+{
+  return gettext(msgid);
+}
+
 char* vncConvertLF(const char* src, size_t bytes)
 {
   try {
@@ -239,7 +233,9 @@ int vncIsValidUTF8(const char* str, size_t bytes)
 
 void vncSetDisplayName(const char *displayNumStr)
 {
+#ifdef HAVE_PAM
   std::string displayName(":");
   displayName += displayNumStr;
   rfb::UnixPasswordValidator::setDisplayName(displayName);
+#endif
 }

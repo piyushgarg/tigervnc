@@ -41,7 +41,7 @@ import static javax.swing.ScrollPaneConstants.VERTICAL_SCROLLBAR_ALWAYS;
 
 import static com.tigervnc.vncviewer.Parameters.*;
 
-public class DesktopWindow extends JFrame
+public final class DesktopWindow extends JFrame
 {
 
   static LogWriter vlog = new LogWriter("DesktopWindow");
@@ -101,6 +101,7 @@ public class DesktopWindow extends JFrame
     addWindowListener(new WindowAdapter() {
       public void windowClosing(WindowEvent e) {
         cc.close();
+        dispose();
       }
       public void windowDeiconified(WindowEvent e) {
         // ViewportBorder sometimes lost when window is shaded or de-iconified
@@ -111,12 +112,44 @@ public class DesktopWindow extends JFrame
     addWindowStateListener(new WindowAdapter() {
       public void windowStateChanged(WindowEvent e) {
         int state = e.getNewState();
-        if ((state & JFrame.MAXIMIZED_BOTH) != JFrame.MAXIMIZED_BOTH) {
-          Rectangle b = getGraphicsConfiguration().getBounds();
+        if ((state & JFrame.MAXIMIZED_BOTH) == JFrame.MAXIMIZED_BOTH) {
+          // Both Windows and Linux will only ever maximize a decorated
+          // frame onto the single monitor the window happens to be on,
+          // regardless of what bounds we ask for via setMaximizedBounds().
+          // To span multiple monitors we
+          // have to decline the native maximize and do it ourselves by
+          // manually resizing the (still decorated, still NORMAL) frame.
+          // Since the frame never actually enters MAXIMIZED_BOTH in that
+          // case, every click of the native maximize button re-delivers
+          // this same event, which we use to toggle span <-> restore.
+          if (maximizeAllMonitors.getValue() && !fullScreen.getValue() &&
+              !fullscreen_active()) {
+            setExtendedState(JFrame.NORMAL);
+            if (!spanMaximized) {
+              preSpanBounds = getBounds();
+              setBounds(spanBounds());
+              spanMaximized = true;
+            } else {
+              setBounds(preSpanBounds);
+              spanMaximized = false;
+            }
+          } else {
+            setMaximizedBounds(getMaximizedScreenBounds());
+          }
+          java.awt.EventQueue.invokeLater(() -> {
+            repositionViewport();
+          });
+        } else if (!spanMaximized) {
+          // Skip this "keep the window on screen" correction while
+          // spanMaximized: forcing NORMAL to decline the native maximize
+          // (above) fires its own windowStateChanged(NORMAL) event, and
+          // this check would otherwise snap our intentionally
+          // border-compensated position (see spanBounds()) back onto the
+          // uncompensated screen bounds.
+          Rectangle b = getScreenBounds();
           if (!b.contains(getLocationOnScreen()))
             setLocation((int)b.getX(), (int)b.getY());
         }
-        // ViewportBorder sometimes lost when restoring on Windows
         repositionViewport();
       }
     });
@@ -202,16 +235,19 @@ public class DesktopWindow extends JFrame
 
   private void repositionViewport()
   {
+    scroll.setViewportBorder(null);
     scroll.revalidate();
     Rectangle r = scroll.getViewportBorderBounds();
     int dx = r.width - viewport.scaledWidth;
     int dy = r.height - viewport.scaledHeight;
-    int top = (int)Math.max(Math.floor(dy/2), 0);
-    int left = (int)Math.max(Math.floor(dx/2), 0);
+    int top = (int)Math.max(Math.floor(dy/2.0), 0);
+    int left = (int)Math.max(Math.floor(dx/2.0), 0);
     int bottom = (int)Math.max(dy - top, 0);
     int right = (int)Math.max(dx - left, 0);
-    Insets insets = new Insets(top, left, bottom, right);
-    scroll.setViewportBorder(new MatteBorder(insets, Color.BLACK));
+    if (top > 0 || left > 0 || bottom > 0 || right > 0) {
+      Insets insets = new Insets(top, left, bottom, right);
+      scroll.setViewportBorder(new MatteBorder(insets, Color.BLACK));
+    }
     scroll.revalidate();
   }
 
@@ -220,8 +256,12 @@ public class DesktopWindow extends JFrame
     return viewport.getPreferredPF();
   }
 
-  public void setName(String name)
+  public void setName(final String name)
   {
+    if (!javax.swing.SwingUtilities.isEventDispatchThread()) {
+      javax.swing.SwingUtilities.invokeLater(() -> setName(name));
+      return;
+    }
     setTitle(name);
   }
 
@@ -230,15 +270,28 @@ public class DesktopWindow extends JFrame
 
   public void updateWindow()
   {
+    if (!javax.swing.SwingUtilities.isEventDispatchThread()) {
+      javax.swing.SwingUtilities.invokeLater(this::updateWindow);
+      return;
+    }
+
     if (firstUpdate) {
       pack();
+
+      // Set this up front (not just when auto-maximizing below) so that
+      // a manually-triggered native OS maximize is correct on the very
+      // first click, rather than only from the second maximize onward.
+      setMaximizedBounds(getMaximizedScreenBounds());
+
       if (fullScreen.getValue())
         fullscreen_on();
       else
         setVisible(true);
 
-      if (maximize.getValue())
+      if (maximize.getValue()) {
+        setMaximizedBounds(getMaximizedScreenBounds());
         setExtendedState(JFrame.MAXIMIZED_BOTH);
+      }
 
       if (cc.server.supportsSetDesktopSize && !desktopSize.getValue().equals("")) {
         // Hack: Wait until we're in the proper mode and position until
@@ -288,22 +341,30 @@ public class DesktopWindow extends JFrame
     validate();
   }
 
-  public void setCursor(int width, int height, Point hotspot,
-                        byte[] data)
+  public void setCursor(final int width, final int height,
+                        final Point hotspot, final byte[] data)
   {
+    if (!javax.swing.SwingUtilities.isEventDispatchThread()) {
+      javax.swing.SwingUtilities.invokeLater(
+        () -> setCursor(width, height, hotspot, data));
+      return;
+    }
     viewport.setCursor(width, height, hotspot, data);
   }
 
   public void fullscreen_on()
   {
     fullScreen.setParam(true);
-    lastState = getExtendedState();
-    lastBounds = getBounds();
-    dispose();
-    // Screen bounds calculation affected by maximized window?
-    setExtendedState(JFrame.NORMAL);
-    setUndecorated(true);
-    setVisible(true);
+    if (!fullscreen_active()) {
+      lastState = getExtendedState();
+      lastBounds = spanMaximized ? preSpanBounds : getBounds();
+      spanMaximized = false;
+      dispose();
+      // Screen bounds calculation affected by maximized window?
+      setExtendedState(JFrame.NORMAL);
+      setUndecorated(true);
+      setVisible(true);
+    }
     setBounds(getScreenBounds());
   }
 
@@ -463,6 +524,16 @@ public class DesktopWindow extends JFrame
         // end up with no screens in the layout. Add a fake one...
         if (layout.num_screens() == 0)
           layout.add_screen(new Screen(0, 0, 0, width, height, 0));
+
+        // Try to be kind to servers in the simple case of toggling between
+        // windowed and full screen by retaining the same screen
+        if ((layout.num_screens() == 1) &&
+            (cc.server.screenLayout().num_screens() == 1)) {
+          Screen newScr = (Screen)layout.begin().next();
+          Screen oldScr = (Screen)cc.server.screenLayout().begin().next();
+          newScr.id = oldScr.id;
+          newScr.flags = oldScr.flags;
+        }
       }
     }
 
@@ -536,24 +607,162 @@ public class DesktopWindow extends JFrame
   public boolean isMaximized()
   {
     int state = getExtendedState();
-    return ((state & JFrame.MAXIMIZED_BOTH) == JFrame.MAXIMIZED_BOTH);
+    if ((state & JFrame.MAXIMIZED_BOTH) == JFrame.MAXIMIZED_BOTH)
+      return true;
+    return spanMaximized;
   }
 
   public Dimension getScreenSize() {
     return getScreenBounds().getSize();
   }
 
+  private static Set<Integer> getSelectedMonitorIndices() {
+    Set<Integer> set = new HashSet<Integer>();
+    String selStr = fullScreenSelectedMonitors.getValueStr();
+    if (selStr != null && !selStr.trim().isEmpty()) {
+      for (String part : selStr.split(",")) {
+        try {
+          set.add(Integer.parseInt(part.trim()) - 1);
+        } catch (NumberFormatException ignored) {}
+      }
+    }
+    return set;
+  }
+
+  private static boolean isSpanAllMonitors() {
+    String mode = fullScreenMode.getValueStr().toLowerCase(Locale.ENGLISH);
+    if (mode.equals("all")) return true;
+    if (mode.equals("selected")) return true;
+    if (getSelectedMonitorIndices().size() > 1) return true;
+    if (fullScreenAllMonitors.getValue() && !mode.equals("current")) return true;
+    return false;
+  }
+
+  // Returns the union of the given screen bounds, or null if none were given.
+  // Pure geometry, independent of GraphicsEnvironment, so it can be
+  // exercised directly in a unit test with synthetic Rectangles (e.g. to
+  // check behavior across monitors with mismatched/scaled bounds) without
+  // needing real multi-monitor hardware.
+  static Rectangle unionBounds(java.util.List<Rectangle> bounds) {
+    Rectangle r = null;
+    for (Rectangle b : bounds)
+      r = (r == null) ? new Rectangle(b) : r.union(b);
+    return r;
+  }
+
+  // Returns a copy of bounds with insets subtracted from each edge.
+  static Rectangle applyInsets(Rectangle bounds, Insets insets) {
+    Rectangle r = new Rectangle(bounds);
+    r.x += insets.left;
+    r.y += insets.top;
+    r.width -= (insets.left + insets.right);
+    r.height -= (insets.top + insets.bottom);
+    return r;
+  }
+
   public Rectangle getScreenBounds() {
     GraphicsEnvironment ge =
       GraphicsEnvironment.getLocalGraphicsEnvironment();
-    Rectangle r = new Rectangle();
-    if (fullScreenAllMonitors.getValue()) {
-      for (GraphicsDevice gd : ge.getScreenDevices())
+    String mode = fullScreenMode.getValueStr().toLowerCase(Locale.ENGLISH);
+    ArrayList<Rectangle> screens = new ArrayList<Rectangle>();
+
+    if (mode.equals("selected")) {
+      Set<Integer> indices = getSelectedMonitorIndices();
+      GraphicsDevice[] devices = ge.getScreenDevices();
+      for (int i = 0; i < devices.length; i++) {
+        if (indices.contains(i)) {
+          for (GraphicsConfiguration gc : devices[i].getConfigurations())
+            screens.add(gc.getBounds());
+        }
+      }
+    } else if (!mode.equals("current")) {
+      for (GraphicsDevice gd : ge.getScreenDevices()) {
         for (GraphicsConfiguration gc : gd.getConfigurations())
-          r = r.union(gc.getBounds());
-    } else {
+          screens.add(gc.getBounds());
+      }
+    }
+
+    Rectangle r = unionBounds(screens);
+    if (r == null) {
       GraphicsConfiguration gc = getGraphicsConfiguration();
       r = gc.getBounds();
+    }
+    return r != null ? r : new Rectangle(0, 0, 800, 600);
+  }
+
+  public Rectangle getMaximizedScreenBounds() {
+    GraphicsEnvironment ge =
+      GraphicsEnvironment.getLocalGraphicsEnvironment();
+    String mode = fullScreenMode.getValueStr().toLowerCase(Locale.ENGLISH);
+    ArrayList<Rectangle> screens = new ArrayList<Rectangle>();
+
+    if (mode.equals("selected")) {
+      Set<Integer> indices = getSelectedMonitorIndices();
+      GraphicsDevice[] devices = ge.getScreenDevices();
+      for (int i = 0; i < devices.length; i++) {
+        if (indices.contains(i)) {
+          GraphicsConfiguration gc = devices[i].getDefaultConfiguration();
+          Rectangle b = applyInsets(gc.getBounds(),
+                      Toolkit.getDefaultToolkit().getScreenInsets(gc));
+          screens.add(b);
+        }
+      }
+    } else if (mode.equals("windowed")) {
+      // Native single-monitor maximize (below) already matches the C++
+      // viewer's behavior. Only span all monitors here if the user has
+      // explicitly opted in, since a decorated frame's native maximize
+      // can't be made to span monitors (confirmed on both Windows and
+      // Linux).
+      if (maximizeAllMonitors.getValue()) {
+        GraphicsDevice[] devices = ge.getScreenDevices();
+        for (int i = 0; i < devices.length; i++) {
+          GraphicsConfiguration gc = devices[i].getDefaultConfiguration();
+          Rectangle b = applyInsets(gc.getBounds(),
+                      Toolkit.getDefaultToolkit().getScreenInsets(gc));
+          screens.add(b);
+        }
+      }
+    } else if (!mode.equals("current")) {
+      GraphicsDevice[] devices = ge.getScreenDevices();
+      for (int i = 0; i < devices.length; i++) {
+        GraphicsConfiguration gc = devices[i].getDefaultConfiguration();
+        Rectangle b = applyInsets(gc.getBounds(),
+                    Toolkit.getDefaultToolkit().getScreenInsets(gc));
+        screens.add(b);
+      }
+    }
+
+    Rectangle virtualBounds = unionBounds(screens);
+    if (virtualBounds == null) {
+      GraphicsConfiguration gc = getGraphicsConfiguration();
+      virtualBounds = applyInsets(gc.getBounds(),
+                      Toolkit.getDefaultToolkit().getScreenInsets(gc));
+    }
+    return virtualBounds != null ? virtualBounds : new Rectangle(0, 0, 800, 600);
+  }
+
+  // On Windows, a decorated top-level window that is NORMAL (not
+  // natively maximized) has an invisible resize-drag border a few
+  // pixels wide on its left/right/bottom edges (no such padding on
+  // top, which is covered by the title bar). Native maximize silently
+  // compensates for this so the visible window still looks flush with
+  // the monitor edge; since we deliberately keep the window NORMAL to
+  // span multiple monitors (see windowStateChanged above), we have to
+  // do that compensation ourselves, or the visible window falls short
+  // of the monitor edges by that amount on three sides.
+  //
+  // This is a fixed, empirically-derived value (the stock Windows 10/11
+  // border width at 100% scaling) rather than something queryable from
+  // pure AWT/Swing. It may need adjustment for other DPI scale factors.
+  private static final int WINDOWS_INVISIBLE_BORDER = 7;
+
+  private Rectangle spanBounds() {
+    Rectangle r = getMaximizedScreenBounds();
+    if (VncViewer.os.startsWith("windows")) {
+      r = new Rectangle(r.x - WINDOWS_INVISIBLE_BORDER,
+                        r.y,
+                        r.width + 2 * WINDOWS_INVISIBLE_BORDER,
+                        r.height + WINDOWS_INVISIBLE_BORDER);
     }
     return r;
   }
@@ -572,7 +781,7 @@ public class DesktopWindow extends JFrame
   public static void setFullScreenWindow(Window fullScreenWindow) {
     GraphicsEnvironment ge =
       GraphicsEnvironment.getLocalGraphicsEnvironment();
-    if (fullScreenAllMonitors.getValue()) {
+    if (isSpanAllMonitors()) {
       for (GraphicsDevice gd : ge.getScreenDevices())
         gd.setFullScreenWindow(fullScreenWindow);
     } else {
@@ -583,8 +792,12 @@ public class DesktopWindow extends JFrame
 
   public void handleOptions()
   {
+    // Monitor-selection options (FullScreenMode/FullScreenAllMonitors/
+    // FullScreenSelectedMonitors) may have changed, so refresh the bounds
+    // used for a subsequent native OS maximize.
+    setMaximizedBounds(getMaximizedScreenBounds());
 
-    if (fullScreen.getValue() && !fullscreen_active())
+    if (fullScreen.getValue())
       fullscreen_on();
     else if (!fullScreen.getValue() && fullscreen_active())
       fullscreen_off();
@@ -693,6 +906,8 @@ public class DesktopWindow extends JFrame
   private boolean delayedFullscreen;
   private boolean delayedDesktopSize;
   private boolean canDoLionFS;
+  private boolean spanMaximized;
+  private Rectangle preSpanBounds;
   private String lastScaleFactor;
   private Rectangle lastBounds;
   private int lastState;

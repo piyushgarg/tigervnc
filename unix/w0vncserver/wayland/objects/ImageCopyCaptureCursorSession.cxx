@@ -26,6 +26,7 @@
 
 #include <core/LogWriter.h>
 #include <core/Rect.h>
+#include <core/i18n.h>
 
 #include "ImageCopyCaptureSession.h"
 #include "ImageCopyCaptureCursorSession.h"
@@ -57,9 +58,7 @@ ImageCopyCaptureCursorSession::ImageCopyCaptureCursorSession(Display* display_,
                                                              std::function<void(int, int, const core::Point&, uint32_t, uint32_t, const uint8_t*)>
                                                                cursorFrameCb_,
                                                              std::function<void(const core::Point&)>
-                                                               cursorPosCb_,
-                                                             std::function<void()>
-                                                               stoppedCb_)
+                                                               cursorPosCb_)
   : session(session_), captureSession(nullptr),
     cursorFrameCb(cursorFrameCb_), cursorPosCb(cursorPosCb_),
     hotspot({0, 0})
@@ -71,7 +70,7 @@ ImageCopyCaptureCursorSession::ImageCopyCaptureCursorSession(Display* display_,
 
   if (!captureSessionHandle) {
     ext_image_copy_capture_cursor_session_v1_destroy(session);
-    throw std::runtime_error("Could not create cursor capture session");
+    throw std::runtime_error(_("Failed to create cursor capture session"));
   }
 
   std::function<void(uint8_t*, core::Region, uint32_t, uint32_t)> bufferEventCb =
@@ -86,7 +85,7 @@ ImageCopyCaptureCursorSession::ImageCopyCaptureCursorSession(Display* display_,
   captureSession = new ImageCopyCaptureSession(display_,
                                                captureSessionHandle,
                                                bufferEventCb,
-                                               stoppedCb_);
+                                               []() {});
 }
 
 ImageCopyCaptureCursorSession::~ImageCopyCaptureCursorSession()

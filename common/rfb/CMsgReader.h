@@ -44,10 +44,6 @@ namespace rfb {
     // readMsg() reads a message, calling the handler as appropriate.
     bool readMsg();
 
-    rdr::InStream* getInStream() { return is; }
-
-    int imageBufIdealSize;
-
   protected:
     bool readSetColourMapEntries();
     bool readBell();
@@ -72,6 +68,8 @@ namespace rfb {
     bool readExtendedDesktopSize(int x, int y, int w, int h);
     bool readLEDState();
     bool readVMwareLEDState();
+
+    bool readQEMUServerMessage();
 
   private:
     CMsgHandler* handler;

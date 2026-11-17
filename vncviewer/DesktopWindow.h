@@ -28,6 +28,8 @@
 
 #include <FL/Fl_Window.H>
 
+#include <rfb/ScreenSet.h>
+
 namespace rfb { class ModifiablePixelBuffer; }
 
 class CConn;
@@ -41,9 +43,6 @@ public:
 
   DesktopWindow(int w, int h, CConn* cc_);
   ~DesktopWindow();
-
-  // Most efficient format (from DesktopWindow's point of view)
-  const rfb::PixelFormat &getPreferredPF();
 
   // Flush updates to screen
   void updateWindow();
@@ -142,6 +141,8 @@ private:
 
   bool pendingRemoteResize;
   struct timeval lastResize;
+  int lastResizeWidth, lastResizeHeight;
+  rfb::ScreenSet lastResizeLayout;
 
   bool keyboardGrabbed;
   bool mouseGrabbed;

@@ -21,9 +21,7 @@
 // XserverDesktop.cxx
 //
 
-#ifdef HAVE_CONFIG_H
 #include <config.h>
-#endif
 
 #include <assert.h>
 #include <signal.h>
@@ -39,6 +37,7 @@
 
 #include <core/Configuration.h>
 #include <core/LogWriter.h>
+#include <core/i18n.h>
 
 #include <rdr/FdInStream.h>
 #include <rdr/FdOutStream.h>
@@ -46,6 +45,7 @@
 #include <network/Socket.h>
 
 #include <rfb/VNCServerST.h>
+#include <rfb/SConnection.h>
 #include <rfb/ServerCore.h>
 
 #include "XserverDesktop.h"
@@ -65,13 +65,15 @@ static core::LogWriter vlog("XserverDesktop");
 
 core::BoolParameter
   rawKeyboard("RawKeyboard",
-              "Send keyboard events straight through and avoid mapping "
-              "them to the current keyboard layout", false);
+              _("Send keyboard events straight through and avoid "
+                "mapping them to the current keyboard layout"),
+              false);
 core::IntParameter
   queryConnectTimeout("QueryConnectTimeout",
-                      "Number of seconds to show the 'Accept "
-                      "connection' dialog before rejecting the "
-                      "connection", 10, 0, INT_MAX);
+                      _("Number of seconds to show the 'Accept "
+                        "connection' dialog before rejecting the "
+                        "connection"),
+                      10, 0, INT_MAX);
 
 
 XserverDesktop::XserverDesktop(int screenIndex_,
@@ -82,7 +84,7 @@ XserverDesktop::XserverDesktop(int screenIndex_,
   : screenIndex(screenIndex_),
     server(0), listeners(listeners_),
     shadowFramebuffer(nullptr),
-    queryConnectId(0), queryConnectTimer(this)
+    pendingQuery(nullptr), queryConnectTimer(this)
 {
   format = pf;
 
@@ -166,28 +168,26 @@ void XserverDesktop::init(rfb::VNCServer* vs)
   // ready state
 }
 
-void XserverDesktop::queryConnection(network::Socket* sock,
-                                     const char* userName)
+void XserverDesktop::queryConnection(rfb::SConnection* conn)
 {
   int count;
 
   if (queryConnectTimer.isStarted()) {
-    server->approveConnection(sock, false, "Another connection is currently being queried.");
+    server->approveConnection(conn, false,
+                              _("Another connection is currently being "
+                                "queried."));
     return;
   }
 
   count = vncNotifyQueryConnect();
   if (count == 0) {
-    server->approveConnection(sock, false, "Unable to query the local user to accept the connection.");
+    server->approveConnection(conn, false,
+                              _("Unable to query the local user to "
+                                "accept the connection."));
     return;
   }
 
-  queryConnectAddress = sock->getPeerAddress();
-  if (!userName)
-    userName = "(anonymous)";
-  queryConnectUsername = userName;
-  queryConnectId = (uint32_t)(intptr_t)sock;
-  queryConnectSocket = sock;
+  pendingQuery = conn;
 
   queryConnectTimer.start(queryConnectTimeout * 1000);
 }
@@ -314,7 +314,7 @@ void XserverDesktop::handleSocketEvent(int fd, bool read, bool write)
     if (handleSocketReadWrite(fd, read, write))
       return;
 
-    vlog.error("Cannot find file descriptor for socket event");
+    vlog.error(_("Cannot find file descriptor for socket event"));
   } catch (std::exception& e) {
     vlog.error("XserverDesktop::handleSocketEvent: %s",e.what());
   }
@@ -387,6 +387,7 @@ void XserverDesktop::blockHandler(int* timeout)
         server->removeSocket(*i);
         vncClientGone(fd);
         delete (*i);
+        continue;
       }
 
       /* Update existing NotifyFD to listen for write (or not) */
@@ -432,7 +433,7 @@ bool XserverDesktop::addClient(network::Socket* sock,
 void XserverDesktop::disconnectClients()
 {
   vlog.debug("Disconnecting all clients");
-  return server->closeClients("Disconnection from server end");
+  return server->closeClients(_("User requested disconnection"));
 }
 
 
@@ -441,15 +442,29 @@ void XserverDesktop::getQueryConnect(uint32_t* opaqueId,
                                      const char** username,
                                      int *timeout)
 {
-  *opaqueId = queryConnectId;
+  std::list<network::Socket*> sockets;
+
+  // Check if this connection is still valid
+  server->getSockets(&sockets);
+  if (std::find_if(sockets.begin(), sockets.end(),
+                   [this](network::Socket* sock) {
+                     return server->getConnection(sock) == pendingQuery;
+                   }) == sockets.end()) {
+    pendingQuery = nullptr;
+    queryConnectTimer.stop();
+  }
+
+  *opaqueId = (uint32_t)(intptr_t)pendingQuery;
 
   if (!queryConnectTimer.isStarted()) {
     *address = "";
     *username = "";
     *timeout = 0;
   } else {
-    *address = queryConnectAddress.c_str();
-    *username = queryConnectUsername.c_str();
+    *address = pendingQuery->getSock()->getPeerAddress();
+    *username = pendingQuery->getUserName();
+    if ((*username)[0] == '\0')
+      *username = _("(anonymous)");
     *timeout = queryConnectTimeout;
   }
 }
@@ -457,9 +472,9 @@ void XserverDesktop::getQueryConnect(uint32_t* opaqueId,
 void XserverDesktop::approveConnection(uint32_t opaqueId, bool accept,
                                        const char* rejectMsg)
 {
-  if (queryConnectId == opaqueId) {
-    server->approveConnection(queryConnectSocket, accept, rejectMsg);
-    queryConnectId = 0;
+  if ((uint32_t)(intptr_t)pendingQuery == opaqueId) {
+    server->approveConnection(pendingQuery, accept, rejectMsg);
+    pendingQuery = nullptr;
     queryConnectTimer.stop();
   }
 }
@@ -505,8 +520,9 @@ void XserverDesktop::frameTick(uint64_t msc)
     next = iter; next++;
 
     if (iter->second <= msc) {
+      uint64_t id = iter->first;
       pendingMsc.erase(iter->first);
-      vncPresentMscEvent(iter->first, msc);
+      vncPresentMscEvent(id, msc);
     }
 
     iter = next;
@@ -558,8 +574,8 @@ void XserverDesktop::keyEvent(uint32_t keysym, uint32_t keycode, bool down)
 void XserverDesktop::handleTimeout(core::Timer* t)
 {
   if (t == &queryConnectTimer) {
-    server->approveConnection(queryConnectSocket, false,
-                              "The attempt to prompt the user to "
-                              "accept the connection failed");
+    server->approveConnection(pendingQuery, false,
+                              _("The attempt to prompt the user to "
+                                "accept the connection failed"));
   }
 }

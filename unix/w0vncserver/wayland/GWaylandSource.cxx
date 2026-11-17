@@ -29,7 +29,9 @@
 #include <wayland-client-core.h>
 
 #include <core/LogWriter.h>
+#include <core/i18n.h>
 
+#include "../w0vncserver.h"
 #include "objects/Display.h"
 #include "GWaylandSource.h"
 
@@ -59,7 +61,7 @@ GSourceFuncs GWaylandSource::sourceFuncs {
 };
 
 GWaylandSource::GWaylandSource(Display* display_)
-  : source(nullptr), display(display_), tag(nullptr)
+  : source(nullptr), display(display_), tag(nullptr), prepared(false)
 {
   int fd;
   GIOCondition conditions;
@@ -70,7 +72,6 @@ GWaylandSource::GWaylandSource(Display* display_)
   fd = wl_display_get_fd(display->getDisplay());
 
   tag = g_source_add_unix_fd(source, fd, conditions);
-  prepared = false;
 
   sources[source] = this;
 }
@@ -89,46 +90,40 @@ void GWaylandSource::attach(GMainContext* context) {
 
 int GWaylandSource::prepare(int* timeout)
 {
-  wl_display_flush(display->getDisplay());
-
   *timeout = -1;
 
-  if (prepared)
-    return FALSE;
+  while (wl_display_prepare_read(display->getDisplay()) != 0)
+    wl_display_dispatch_pending(display->getDisplay());
 
-  // We only want to call wl_display_prepare_read() once
+  wl_display_flush(display->getDisplay());
+
   prepared = true;
-
-  if (wl_display_prepare_read(display->getDisplay()) != 0) {
-    if (wl_display_dispatch_pending(display->getDisplay()) < 0) {
-      // FIXME: Stop here?
-      vlog.error("Failed to flush wl_display: %s", strerror(errno));
-    }
-  }
 
   return FALSE;
 }
 
 int GWaylandSource::check()
 {
-  return g_source_query_unix_fd(source, tag) > 0;
+  GIOCondition events;
+  events = g_source_query_unix_fd(source, tag);
+
+  if (events & G_IO_IN)
+    wl_display_read_events(display->getDisplay());
+  else
+    wl_display_cancel_read(display->getDisplay());
+
+  prepared = false;
+
+  return events > 0;
 }
 
 int GWaylandSource::dispatch()
 {
-  GIOCondition events;
-
-  events = g_source_query_unix_fd(source, tag);
-
-  assert(prepared);
-
-  if (events & G_IO_IN)
-    wl_display_read_events(display->getDisplay());
-  if (events & G_IO_HUP || events & G_IO_ERR)
-    wl_display_cancel_read(display->getDisplay());
-
   wl_display_dispatch_pending(display->getDisplay());
-  prepared = false;
+
+  if (wl_display_get_error(display->getDisplay()))
+    fatal_error(_("Failed to communicate with Wayland server: %s"),
+                strerror(wl_display_get_error(display->getDisplay())));
 
   return G_SOURCE_CONTINUE;
 }

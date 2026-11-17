@@ -1,7 +1,7 @@
 /* Copyright (C) 2002-2005 RealVNC Ltd.  All Rights Reserved.
  * Copyright 2009-2011 Pierre Ossman for Cendio AB
  * Copyright (C) 2011 D. R. Commander.  All Rights Reserved.
- * Copyright (C) 2011-2019 Brian P. Hinz
+ * Copyright (C) 2011-2026 Brian P. Hinz
  *
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -72,6 +72,29 @@ abstract public class CMsgHandler {
   {
     server.supportsContinuousUpdates = true;
   }
+
+  public void supportsQEMUKeyEvent()
+  {
+    server.supportsQEMUKeyEvent = true;
+  }
+
+  public void setLEDState(int state)
+  {
+    server.setLEDState(state);
+  }
+
+  // No-op by default (matches the C++ CConnection base behavior): the
+  // Java viewer has no pointer-grab/capture mode, which is the only
+  // context in which C++ actually warps the local cursor in response
+  // to this, so there is nothing meaningful to do with it here.
+  public void setCursorPos(Point pos) { }
+
+  abstract public void handleClipboardCaps(int flags, int[] lengths);
+  abstract public void handleClipboardRequest(int flags);
+  abstract public void handleClipboardPeek();
+  abstract public void handleClipboardNotify(int flags);
+  abstract public void handleClipboardProvide(int flags, int[] lengths,
+                                              byte[][] data);
 
   abstract public void clientRedirect(int port, String host,
                                       String x509subject);

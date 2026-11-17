@@ -3,7 +3,7 @@
  * Copyright (C) 2005 Martin Koegler
  * Copyright (C) 2010 m-privacy GmbH
  * Copyright (C) 2010 TigerVNC Team
- * Copyright (C) 2011-2019 Brian P. Hinz
+ * Copyright (C) 2011-2026 Brian P. Hinz
  * Copyright (C) 2015 D. R. Commander.  All Rights Reserved.
  *
  * This is free software; you can redistribute it and/or modify
@@ -100,9 +100,9 @@ public class CSecurityTLS extends CSecurity {
 
   public static void setDefaults()
   {
-    if (new File(getDefaultCA()).exists())
+    if (new File(getDefaultCA()).isFile())
       X509CA.setDefaultStr(getDefaultCA());
-    if (new File(getDefaultCRL()).exists())
+    if (new File(getDefaultCRL()).isFile())
       X509CRL.setDefaultStr(getDefaultCRL());
   }
 
@@ -209,7 +209,7 @@ public class CSecurityTLS extends CSecurity {
             for (X509Certificate c : ((X509TrustManager)m).getAcceptedIssuers())
               ks.setCertificateEntry(getThumbprint((X509Certificate)c), c);
         File cacert = new File(cafile);
-        if (cacert.exists() && cacert.canRead()) {
+        if (cacert.isFile() && cacert.canRead()) {
           InputStream caStream = new MyFileInputStream(cacert);
           Collection<? extends Certificate> cacerts =
             cf.generateCertificates(caStream);
@@ -221,15 +221,16 @@ public class CSecurityTLS extends CSecurity {
         PKIXBuilderParameters params =
           new PKIXBuilderParameters(ks, new X509CertSelector());
         File crlcert = new File(crlfile);
-        if (!crlcert.exists() || !crlcert.canRead()) {
+        if (!crlcert.isFile() || !crlcert.canRead()) {
           params.setRevocationEnabled(false);
         } else {
-          InputStream crlStream = new FileInputStream(crlfile);
-          Collection<? extends CRL> crls = cf.generateCRLs(crlStream);
-          CertStoreParameters csp = new CollectionCertStoreParameters(crls);
-          CertStore store = CertStore.getInstance("Collection", csp);
-          params.addCertStore(store);
-          params.setRevocationEnabled(true);
+          try (InputStream crlStream = new FileInputStream(crlfile)) {
+            Collection<? extends CRL> crls = cf.generateCRLs(crlStream);
+            CertStoreParameters csp = new CollectionCertStoreParameters(crls);
+            CertStore store = CertStore.getInstance("Collection", csp);
+            params.addCertStore(store);
+            params.setRevocationEnabled(true);
+          }
         }
         tmf = TrustManagerFactory.getInstance("PKIX");
         tmf.init(new CertPathTrustManagerParameters(params));
@@ -298,24 +299,22 @@ public class CSecurityTLS extends CSecurity {
         "  SHA-1 Fingerprint: "+getThumbprint(cert)+"\n";
       try {
         if (dbPath.exists()) {
-          FileReader db = new FileReader(dbPath);
-          BufferedReader dbBuf = new BufferedReader(db);
-          String line;
           String server = client.getServerName().toLowerCase();
-          while ((line = dbBuf.readLine())!=null) {
-            String fields[] = line.split("\\|");
-            if (fields.length==6) {
-              if (server.equals(fields[2]) && pk.equals(fields[5])) {
-                vlog.debug("Server certificate found in known hosts file");
-                dbBuf.close();
-                return;
-              } else if (server.equals(fields[2]) && !pk.equals(fields[5]) ||
-                         !server.equals(fields[2]) && pk.equals(fields[5])) {
-                throw new CertStoreException();
+          try (BufferedReader dbBuf = new BufferedReader(new FileReader(dbPath))) {
+            String line;
+            while ((line = dbBuf.readLine())!=null) {
+              String fields[] = line.split("\\|");
+              if (fields.length==6) {
+                if (server.equals(fields[2]) && pk.equals(fields[5])) {
+                  vlog.debug("Server certificate found in known hosts file");
+                  return;
+                } else if (server.equals(fields[2]) && !pk.equals(fields[5]) ||
+                           !server.equals(fields[2]) && pk.equals(fields[5])) {
+                  throw new CertStoreException();
+                }
               }
             }
           }
-          dbBuf.close();
         }
         tm.checkServerTrusted(chain, authType);
       } catch (IOException e) {
@@ -358,16 +357,15 @@ public class CSecurityTLS extends CSecurity {
       ArrayList<String> lines = new ArrayList<String>();
       try {
         if (dbPath.exists()) {
-          FileReader db = new FileReader(dbPath);
-          BufferedReader dbBuf = new BufferedReader(db);
-          String line;
-          while ((line = dbBuf.readLine())!=null) {
-            String fields[] = line.split("\\|");
-            if (fields.length==6)
-              if (!serverName.equals(fields[2]) && !pk.equals(fields[5]))
-                lines.add(line);
+          try (BufferedReader dbBuf = new BufferedReader(new FileReader(dbPath))) {
+            String line;
+            while ((line = dbBuf.readLine())!=null) {
+              String fields[] = line.split("\\|");
+              if (fields.length==6)
+                if (!serverName.equals(fields[2]) && !pk.equals(fields[5]))
+                  lines.add(line);
+            }
           }
-          dbBuf.close();
         }
       } catch (IOException e) {
         throw new AuthFailureException("Could not load known hosts database");
@@ -375,12 +373,12 @@ public class CSecurityTLS extends CSecurity {
       try {
         if (!dbPath.exists())
           dbPath.createNewFile();
-        FileWriter fw = new FileWriter(dbPath.getAbsolutePath(), false);
-        Iterator i = lines.iterator();
-        while (i.hasNext())
-          fw.write((String)i.next()+"\n");
-        fw.write("|g0|"+serverName+"|*|0|"+pk+"\n");
-        fw.close();
+        try (FileWriter fw = new FileWriter(dbPath.getAbsolutePath(), false)) {
+          Iterator i = lines.iterator();
+          while (i.hasNext())
+            fw.write((String)i.next()+"\n");
+          fw.write("|g0|"+serverName+"|*|0|"+pk+"\n");
+        }
       } catch (IOException e) {
         vlog.error("Failed to store server certificate to known hosts database");
       }
@@ -431,7 +429,7 @@ public class CSecurityTLS extends CSecurity {
               if (peer.equals(((String)nxt.get(1)).toLowerCase()))
                 return;
             } else if (((Integer)nxt.get(0)).intValue() == 7) {
-              String peer = ((CConn)client).getSocket().getPeerAddress();
+              String peer = client.getServerName().toLowerCase();
               if (peer.equals(((String)nxt.get(1)).toLowerCase()))
                 return;
             }

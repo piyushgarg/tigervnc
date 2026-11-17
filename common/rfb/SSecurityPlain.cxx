@@ -21,17 +21,21 @@
 #include <config.h>
 #endif
 
+#if !defined(WIN32) && !defined(__APPLE__)
+#include <unistd.h>
+#include <pwd.h>
+#endif
+
 #include <core/Configuration.h>
+#include <core/i18n.h>
 #include <core/string.h>
 
 #include <rfb/SSecurityPlain.h>
 #include <rfb/SConnection.h>
 #include <rfb/Exception.h>
 #include <rdr/InStream.h>
-#if !defined(WIN32) && !defined(__APPLE__)
+#ifdef HAVE_PAM
 #include <rfb/UnixPasswordValidator.h>
-#include <unistd.h>
-#include <pwd.h>
 #endif
 #ifdef WIN32
 #include <rfb/WinPasswdValidator.h>
@@ -41,11 +45,7 @@ using namespace rfb;
 
 core::StringListParameter PasswordValidator::plainUsers
 ("PlainUsers",
- "Users permitted to access via Plain security type (including TLSPlain, X509Plain etc.)"
-#ifdef HAVE_NETTLE
- " or RSA-AES security types (RA2, RA2ne, RA2_256, RA2ne_256)"
-#endif
- ,
+ _("Users permitted to access the server"),
  {});
 
 bool PasswordValidator::validUser(const char* username)
@@ -72,7 +72,7 @@ SSecurityPlain::SSecurityPlain(SConnection* sc_) : SSecurity(sc_)
 {
 #ifdef WIN32
   valid = new WinPasswdValidator();
-#elif !defined(__APPLE__)
+#elif defined(HAVE_PAM)
   valid = new UnixPasswordValidator();
 #else
   valid = nullptr;
@@ -95,11 +95,11 @@ bool SSecurityPlain::processMsg()
 
     ulen = is->readU32();
     if (ulen >= sizeof(username))
-      throw auth_error("Too long username");
+      throw auth_error(_("Username is too long"));
 
     plen = is->readU32();
     if (plen >= sizeof(password))
-      throw auth_error("Too long password");
+      throw auth_error(_("Password is too long"));
 
     state = 1;
   }
@@ -113,7 +113,7 @@ bool SSecurityPlain::processMsg()
     password[plen] = 0;
     username[ulen] = 0;
     plen = 0;
-    std::string msg = "Authentication failed";
+    std::string msg = _("Authentication failed");
     if (!valid->validate(sc, username, password, msg))
       throw auth_error(msg);
   }

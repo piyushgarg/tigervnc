@@ -28,11 +28,13 @@
 #include <algorithm>
 
 #include <core/LogWriter.h>
+#include <core/i18n.h>
 #include <core/string.h>
 
 #include <rfb/Exception.h>
 #include <rfb/clipboardTypes.h>
 #include <rfb/fenceTypes.h>
+#include <rfb/qemuTypes.h>
 #include <rfb/screenTypes.h>
 #include <rfb/CMsgReader.h>
 #include <rfb/CMsgWriter.h>
@@ -41,6 +43,7 @@
 #include <rfb/Decoder.h>
 #include <rfb/KeysymStr.h>
 #include <rfb/PixelBuffer.h>
+#include <rfb/ScreenSet.h>
 #include <rfb/Security.h>
 #include <rfb/SecurityClient.h>
 #include <rfb/CConnection.h>
@@ -56,24 +59,33 @@ using namespace rfb;
 
 static core::LogWriter vlog("CConnection");
 
+// The audio format we ask every server for. Nothing in the viewer
+// varies it, and asking for whatever a sound system happens to prefer
+// would only move a resampling step from one end to the other.
+static const uint8_t audioSampleFormat = qemuAudioFormatS16;
+static const uint8_t audioChannels = 2;
+static const uint32_t audioFrequency = 48000;
+
 core::BoolParameter
-  CConnection::noJpeg("NoJPEG", "Disable lossy JPEG compression.",
+  CConnection::noJpeg("NoJPEG", _("Disable lossy JPEG compression"),
                       false);
 
 CConnection::CConnection()
   : csecurity(nullptr),
     supportsLocalCursor(false), supportsCursorPosition(false),
     supportsDesktopResize(false), supportsLEDState(false),
+    supportsAudio(false),
     is(nullptr), os(nullptr), reader_(nullptr), writer_(nullptr),
     shared(false),
     state_(RFBSTATE_UNINITIALISED),
     pendingPFChange(false), preferredEncoding(encodingTight),
-    compressLevel(2), qualityLevel(-1),
+    compressLevel(-1), qualityLevel(-1),
     formatChange(false), encodingChange(false),
     firstUpdate(true), pendingUpdate(false), continuousUpdates(false),
     forceNonincremental(true),
     framebuffer(nullptr), decoder(this),
-    hasRemoteClipboard(false), hasLocalClipboard(false)
+    hasRemoteClipboard(false), hasLocalClipboard(false),
+    audioRequested(false)
 {
 }
 
@@ -93,6 +105,11 @@ void CConnection::setStreams(rdr::InStream* is_, rdr::OutStream* os_)
 {
   is = is_;
   os = os_;
+
+  delete reader_;
+  reader_ = new CMsgReader(this, is);
+  delete writer_;
+  writer_ = new CMsgWriter(&server, os);
 }
 
 void CConnection::setFramebuffer(ModifiablePixelBuffer* fb)
@@ -182,22 +199,23 @@ bool CConnection::processVersionMsg()
   if (sscanf(verStr, "RFB %03d.%03d\n",
              &majorVersion, &minorVersion) != 2) {
     state_ = RFBSTATE_INVALID;
-    throw protocol_error("Reading version failed, not an RFB server?");
+    throw protocol_error(
+      _("Reading version failed, not an RFB server?"));
   }
 
   server.setVersion(majorVersion, minorVersion);
 
-  vlog.info("Server supports RFB protocol version %d.%d",
+  vlog.info(_("Server supports RFB protocol version %d.%d"),
             server.majorVersion, server.minorVersion);
 
   // The only official RFB protocol versions are currently 3.3, 3.7 and 3.8
   if (server.beforeVersion(3,3)) {
-    vlog.error("Server gave unsupported RFB protocol version %d.%d",
+    vlog.error(_("Server gave unsupported RFB protocol version %d.%d"),
                server.majorVersion, server.minorVersion);
     state_ = RFBSTATE_INVALID;
-    throw protocol_error(
-      core::format("Server gave unsupported RFB protocol version %d.%d",
-                   server.majorVersion, server.minorVersion));
+    throw protocol_error(core::format(
+      _("Server gave unsupported RFB protocol version %d.%d"),
+      server.majorVersion, server.minorVersion));
   } else if (server.beforeVersion(3,7)) {
     server.setVersion(3,3);
   } else if (server.afterVersion(3,8)) {
@@ -211,7 +229,7 @@ bool CConnection::processVersionMsg()
 
   state_ = RFBSTATE_SECURITY_TYPES;
 
-  vlog.info("Using RFB protocol version %d.%d",
+  vlog.info(_("Using RFB protocol version %d.%d"),
             server.majorVersion, server.minorVersion);
 
   return true;
@@ -243,8 +261,8 @@ bool CConnection::processSecurityTypesMsg()
                     secType) == secTypes.end())
         secType = secTypeInvalid;
     } else {
-      vlog.error("Unknown 3.3 security type %d", secType);
-      throw protocol_error("Unknown 3.3 security type");
+      vlog.error(_("Unknown 3.3 security type %d"), secType);
+      throw protocol_error(_("Unknown 3.3 security type"));
     }
 
   } else {
@@ -287,14 +305,15 @@ bool CConnection::processSecurityTypesMsg()
     if (secType != secTypeInvalid) {
       os->writeU8(secType);
       os->flush();
-      vlog.info("Choosing security type %s(%d)",secTypeName(secType),secType);
+      vlog.info(_("Choosing security type %s (%d)"),
+                secTypeName(secType), secType);
     }
   }
 
   if (secType == secTypeInvalid) {
     state_ = RFBSTATE_INVALID;
-    vlog.error("No matching security types");
-    throw protocol_error("No matching security types");
+    vlog.error(_("No matching security types"));
+    throw protocol_error(_("No matching security types"));
   }
 
   state_ = RFBSTATE_SECURITY;
@@ -338,12 +357,12 @@ bool CConnection::processSecurityResultMsg()
     vlog.debug("Auth failed: Too many tries");
     break;
   default:
-    throw protocol_error("Unknown security result from server");
+    throw protocol_error(_("Unknown security result from server"));
   }
 
   if (server.beforeVersion(3,8)) {
     state_ = RFBSTATE_INVALID;
-    throw auth_error("Authentication failed");
+    throw auth_error(_("Authentication failed"));
   }
 
   state_ = RFBSTATE_SECURITY_REASON;
@@ -369,7 +388,10 @@ bool CConnection::processSecurityReasonMsg()
   reason[len] = '\0';
 
   state_ = RFBSTATE_INVALID;
-  throw auth_error(reason.data());
+  if (core::isValidUTF8(reason.data()))
+    throw auth_error(reason.data());
+  else
+    throw auth_error(core::latin1ToUTF8(reason.data()));
 }
 
 bool CConnection::processInitMsg()
@@ -381,8 +403,6 @@ bool CConnection::processInitMsg()
 void CConnection::securityCompleted()
 {
   state_ = RFBSTATE_INITIALISATION;
-  reader_ = new CMsgReader(this, is);
-  writer_ = new CMsgWriter(&server, os);
   vlog.debug("Authentication success!");
   writer_->writeClientInit(shared);
 }
@@ -440,7 +460,7 @@ void CConnection::setExtendedDesktopSize(unsigned reason,
     server.setDimensions(w, h, layout);
 
   if ((reason == reasonClient) && (result != resultSuccess)) {
-    vlog.error("SetDesktopSize failed: %d", result);
+    vlog.error(_("Failed to resize remote session: %d"), result);
     return;
   }
 
@@ -508,6 +528,11 @@ void CConnection::supportsQEMUKeyEvent()
   server.supportsQEMUKeyEvent = true;
 }
 
+void CConnection::supportsQEMUAudio()
+{
+  server.supportsQEMUAudio = true;
+}
+
 void CConnection::supportsExtendedMouseButtons()
 {
   server.supportsExtendedMouseButtons = true;
@@ -543,12 +568,24 @@ void CConnection::serverInit(int width, int height,
 }
 
 bool CConnection::readAndDecodeRect(const core::Rect& r, int encoding,
+                                    const PixelFormat& pf,
                                     ModifiablePixelBuffer* pb)
 {
-  if (!decoder.decodeRect(r, encoding, pb))
-    return false;
+  PixelFormat origPF;
+  bool ret;
+
+  // We might have pending frames using the existing pixel format
   decoder.flush();
-  return true;
+
+  origPF = server.pf();
+  server.setPF(pf);
+
+  ret = decoder.decodeRect(r, encoding, pb);
+  decoder.flush();
+
+  server.setPF(origPF);
+
+  return ret;
 }
 
 void CConnection::framebufferUpdateStart()
@@ -574,7 +611,7 @@ void CConnection::framebufferUpdateEnd()
 
   if (firstUpdate) {
     if (server.supportsContinuousUpdates) {
-      vlog.info("Enabling continuous updates");
+      vlog.info(_("Enabling continuous updates"));
       continuousUpdates = true;
       writer()->writeEnableContinuousUpdates(true, 0, 0,
                                              server.width(),
@@ -583,6 +620,55 @@ void CConnection::framebufferUpdateEnd()
 
     firstUpdate = false;
   }
+
+  // The server tells us it can send audio by sending us a rectangle
+  // with that pseudo encoding, so this is the earliest point at which
+  // we can safely ask for it
+  if (server.supportsQEMUAudio && supportsAudio && !audioRequested)
+    requestAudio();
+}
+
+void CConnection::requestAudio()
+{
+  assert(!audioRequested);
+
+  // Only ask once, whatever the answer. A server that offered audio
+  // and then had it declined will not offer it again.
+  audioRequested = true;
+
+  vlog.info(_("Requesting audio (format %d, %d channels, %d Hz)"),
+            (int)audioSampleFormat, (int)audioChannels,
+            (int)audioFrequency);
+
+  writer()->writeQEMUAudioSetFormat(audioSampleFormat, audioChannels,
+                                    audioFrequency);
+  writer()->writeQEMUAudioEnable(true);
+}
+
+void CConnection::audioBegin()
+{
+  // A server that never got a request for audio has no business
+  // sending any
+  if (!server.supportsQEMUAudio)
+    throw protocol_error(_("Unexpected audio message"));
+
+  handleAudioBegin();
+}
+
+void CConnection::audioEnd()
+{
+  if (!server.supportsQEMUAudio)
+    throw protocol_error(_("Unexpected audio message"));
+
+  handleAudioEnd();
+}
+
+void CConnection::audioData(const uint8_t* data, size_t length)
+{
+  if (!server.supportsQEMUAudio)
+    throw protocol_error(_("Unexpected audio message"));
+
+  handleAudioData(data, length);
 }
 
 bool CConnection::dataRect(const core::Rect& r, int encoding)
@@ -594,7 +680,7 @@ void CConnection::setColourMapEntries(int /*firstColour*/,
                                       int /*nColours*/,
                                       uint16_t* /*rgbs*/)
 {
-  vlog.error("Invalid SetColourMapEntries from server!");
+  vlog.error(_("Invalid SetColourMapEntries from server!"));
 }
 
 void CConnection::serverCutText(const char* str)
@@ -612,8 +698,7 @@ void CConnection::setLEDState(unsigned int state)
   server.setLEDState(state);
 }
 
-void CConnection::handleClipboardCaps(uint32_t flags,
-                                      const uint32_t* lengths)
+void CConnection::clipboardCaps(uint32_t flags, const uint32_t* lengths)
 {
   int i;
   uint32_t sizes[] = { 0 };
@@ -663,7 +748,7 @@ void CConnection::handleClipboardCaps(uint32_t flags,
                                sizes);
 }
 
-void CConnection::handleClipboardRequest(uint32_t flags)
+void CConnection::clipboardRequest(uint32_t flags)
 {
   if (!(flags & rfb::clipboardUTF8)) {
     vlog.debug("Ignoring clipboard request for unsupported formats 0x%x", flags);
@@ -676,13 +761,13 @@ void CConnection::handleClipboardRequest(uint32_t flags)
   handleClipboardRequest();
 }
 
-void CConnection::handleClipboardPeek()
+void CConnection::clipboardPeek()
 {
   if (server.clipboardFlags() & rfb::clipboardNotify)
     writer()->writeClipboardNotify(hasLocalClipboard ? rfb::clipboardUTF8 : 0);
 }
 
-void CConnection::handleClipboardNotify(uint32_t flags)
+void CConnection::clipboardNotify(uint32_t flags)
 {
   hasRemoteClipboard = false;
 
@@ -694,9 +779,9 @@ void CConnection::handleClipboardNotify(uint32_t flags)
   }
 }
 
-void CConnection::handleClipboardProvide(uint32_t flags,
-                                         const size_t* lengths,
-                                         const uint8_t* const* data)
+void CConnection::clipboardProvide(uint32_t flags,
+                                   const size_t* lengths,
+                                   const uint8_t* const* data)
 {
   if (!(flags & rfb::clipboardUTF8)) {
     vlog.debug("Ignoring clipboard provide with unsupported formats 0x%x", flags);
@@ -705,7 +790,7 @@ void CConnection::handleClipboardProvide(uint32_t flags,
 
   // FIXME: This conversion magic should be in CMsgReader
   if (!core::isValidUTF8((const char*)data[0], lengths[0])) {
-    vlog.error("Invalid UTF-8 sequence in clipboard - ignoring");
+    vlog.error(_("Invalid UTF-8 sequence in clipboard"));
     return;
   }
   serverClipboard = core::convertLF((const char*)data[0], lengths[0]);
@@ -733,6 +818,19 @@ void CConnection::handleClipboardAnnounce(bool /*available*/)
 }
 
 void CConnection::handleClipboardData(const char* /*data*/)
+{
+}
+
+void CConnection::handleAudioBegin()
+{
+}
+
+void CConnection::handleAudioEnd()
+{
+}
+
+void CConnection::handleAudioData(const uint8_t* /*data*/,
+                                  size_t /*length*/)
 {
 }
 
@@ -878,6 +976,12 @@ void CConnection::releaseAllKeys()
     sendKeyRelease(downKeys.begin()->first);
 }
 
+void CConnection::sendPointerEvent(const core::Point& pos,
+                                   uint16_t buttonMask)
+{
+  writer()->writePointerEvent(pos, buttonMask);
+}
+
 void CConnection::refreshFramebuffer()
 {
   forceNonincremental = true;
@@ -886,6 +990,16 @@ void CConnection::refreshFramebuffer()
   // single update in flight, so we'll have to wait to do the refresh
   if (continuousUpdates)
     requestNewUpdate();
+}
+
+void CConnection::requestScreenLayout(int width, int height,
+                                      const ScreenSet& layout)
+{
+  vlog.debug("Requesting framebuffer resize from %dx%d to %dx%d",
+             server.width(), server.height(), width, height);
+  vlog.debug("%s", layout.print().c_str());
+
+  writer()->writeSetDesktopSize(width, height, layout);
 }
 
 void CConnection::setPreferredEncoding(int encoding)
@@ -932,6 +1046,17 @@ int CConnection::getQualityLevel()
 
 void CConnection::setPF(const PixelFormat& pf)
 {
+  if (server.beforeVersion(3, 8)) {
+    // Xvnc from TightVNC 1.2.9 sends out FramebufferUpdates with
+    // cursors "asynchronously". If this happens in the middle of a
+    // pixel format change, the server will encode the cursor with
+    // the old format, but the client will try to decode it
+    // according to the new format. This will lead to a
+    // crash. Therefore, we do not allow automatic format change for
+    // old servers.
+    return;
+  }
+
   if (server.pf() == pf && !formatChange)
     return;
 
@@ -1015,6 +1140,8 @@ void CConnection::updateEncodings()
     encodings.push_back(pseudoEncodingLEDState);
     encodings.push_back(pseudoEncodingVMwareLEDState);
   }
+  if (supportsAudio)
+    encodings.push_back(pseudoEncodingQEMUAudio);
 
   encodings.push_back(pseudoEncodingDesktopName);
   encodings.push_back(pseudoEncodingLastRect);

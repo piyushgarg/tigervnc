@@ -125,6 +125,12 @@ public class Parameters {
     "Maximize viewer window",
     false);
 
+  public static BoolParameter maximizeAllMonitors
+  = new BoolParameter("MaximizeAllMonitors",
+    "When maximizing in windowed mode, resize the window to span all "+
+    "monitors instead of using the native single-monitor maximize",
+    false);
+
   public static BoolParameter fullScreen
   = new BoolParameter("FullScreen",
     "Enable full screen",
@@ -134,6 +140,16 @@ public class Parameters {
   = new BoolParameter("FullScreenAllMonitors",
     "Enable full screen over all monitors",
     true);
+
+  public static StringParameter fullScreenMode
+  = new StringParameter("FullScreenMode",
+    "Monitors to use for full-screen mode (windowed, current, all, selected)",
+    "all");
+
+  public static StringParameter fullScreenSelectedMonitors
+  = new StringParameter("FullScreenSelectedMonitors",
+    "Indices of monitors to use when FullScreenMode is set to 'selected'",
+    "");
 
   public static BoolParameter acceptClipboard
   = new BoolParameter("AcceptClipboard",
@@ -243,6 +259,11 @@ public class Parameters {
     "command-line friendly way. If not specified, then the appropriate "+
     "VNC_TUNNEL_CMD or VNC_VIA_CMD command template will be used.", "");
 
+  public static BoolParameter reconnectOnError
+  = new BoolParameter("ReconnectOnError",
+    "Ask to reconnect on connection errors",
+    false);
+
   public static StringParameter sshConfig
   = new StringParameter("SSHConfig",
     "Specifies the path to an OpenSSH configuration file that to "+
@@ -308,8 +329,11 @@ public class Parameters {
     noJpeg,
     qualityLevel,
     maximize,
+    maximizeAllMonitors,
     fullScreen,
     fullScreenAllMonitors,
+    fullScreenMode,
+    fullScreenSelectedMonitors,
     desktopSize,
     remoteResize,
     viewOnly,
@@ -330,6 +354,7 @@ public class Parameters {
     extSSHArgs,
     sshConfig,
     sshKeyFile,
+    reconnectOnError,
   };
 
   static VoidParameter[] readOnlyParameterArray = {

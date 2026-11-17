@@ -39,8 +39,12 @@
 
 #include <core/Configuration.h>
 
+#include <rdr/MemInStream.h>
+#include <rdr/MemOutStream.h>
 #include <rdr/OutStream.h>
 #include <rdr/FileInStream.h>
+
+#include <network/TcpSocket.h>
 
 #include <rfb/AccessRights.h>
 #include <rfb/PixelFormat.h>
@@ -49,6 +53,7 @@
 #include <rfb/CMsgWriter.h>
 #include <rfb/UpdateTracker.h>
 #include <rfb/EncodeManager.h>
+#include <rfb/encodings.h>
 #include <rfb/SConnection.h>
 #include <rfb/SMsgWriter.h>
 
@@ -57,6 +62,9 @@
 static core::IntParameter width("width", "Frame buffer width", 0);
 static core::IntParameter height("height", "Frame buffer height", 0);
 static core::IntParameter count("count", "Number of benchmark iterations", 9);
+static core::EnumParameter encodingParam("encoding", "Encoding to benchmark",
+                                         {"Raw", "RRE", "Hextile", "Tight",
+                                          "ZRLE", "JPEG"}, "Tight");
 
 static core::StringParameter format("format", "Pixel format (e.g. bgr888)", "");
 
@@ -66,13 +74,6 @@ static core::BoolParameter translate("translate",
 
 // The frame buffer (and output) is always this format
 static const rfb::PixelFormat fbPF(32, 24, false, true, 255, 255, 255, 0, 8, 16);
-
-// Encodings to use
-static const int32_t encodings[] = {
-  rfb::encodingTight, rfb::encodingCopyRect, rfb::encodingRRE,
-  rfb::encodingHextile, rfb::encodingZRLE, rfb::pseudoEncodingLastRect,
-  rfb::pseudoEncodingQualityLevel0 + 8,
-  rfb::pseudoEncodingCompressLevel0 + 2};
 
 class DummyOutStream : public rdr::OutStream {
 public:
@@ -96,15 +97,13 @@ public:
   void getStats(double& ratio, unsigned long long& bytes,
                 unsigned long long& rawEquivalent);
 
-  void initDone() override {};
+  void initDone() override;
   void resizeFramebuffer() override;
   void framebufferUpdateStart() override;
   void framebufferUpdateEnd() override;
   bool dataRect(const core::Rect&, int) override;
-  void setColourMapEntries(int, int, uint16_t*) override;
   void bell() override;
-  void serverCutText(const char*) override;
-  virtual void getUserPasswd(bool secure, std::string *user, std::string *password) override;
+  virtual void getUserPasswd(std::string *user, std::string *password) override;
   bool verifyCertificate(unsigned int status,
                          const uint8_t* certificate,
                          size_t length) override;
@@ -114,6 +113,7 @@ public:
 public:
   double decodeTime;
   double encodeTime;
+  double maxEncodeFrameTime;
 
 protected:
   rdr::FileInStream *in;
@@ -135,6 +135,8 @@ public:
   ~SConn();
 
   void writeUpdate(const rfb::UpdateInfo& ui, const rfb::PixelBuffer* pb);
+
+  void setEncoding(int32_t selectedEncoding);
 
   void getStats(double&, unsigned long long&, unsigned long long&);
 
@@ -180,27 +182,43 @@ void DummyOutStream::overrun(size_t needed)
 
 CConn::CConn(const char *filename)
 {
+  rdr::MemOutStream fakeInitOut;
+  rdr::MemInStream* fakeInitIn;
+
   decodeTime = 0.0;
   encodeTime = 0.0;
+  maxEncodeFrameTime = 0.0;
 
   in = new rdr::FileInStream(filename);
   out = new DummyOutStream;
-  setStreams(in, out);
 
   // Need to skip the initial handshake and ServerInit
-  setState(RFBSTATE_NORMAL);
-  // That also means that the reader and writer weren't setup
-  setReader(new rfb::CMsgReader(this, in));
-  setWriter(new rfb::CMsgWriter(&server, out));
-  // Nor the frame buffer size and format
+
+  fakeInitOut.writeBytes((uint8_t*)"RFB 003.008\n", 12);
+  fakeInitOut.writeU8(1);
+  fakeInitOut.writeU8(rfb::secTypeNone);
+  fakeInitOut.writeU32(rfb::secResultOK);
+  fakeInitOut.writeU16(width);
+  fakeInitOut.writeU16(height);
   rfb::PixelFormat pf;
   pf.parse(format);
-  server.setPF(pf);
-  setDesktopSize(width, height);
+  pf.write(&fakeInitOut);
+  fakeInitOut.writeU32(0);
+
+  fakeInitIn = new rdr::MemInStream(fakeInitOut.data(), fakeInitOut.length());
+
+  setStreams(fakeInitIn, out);
+  initialiseProtocol();
+  while (state() != RFBSTATE_NORMAL)
+    processMsg();
+
+  // Now we're ready for the file contents
+
+  setStreams(in, out);
 
   sc = new SConn();
   sc->client.setPF((bool)translate ? fbPF : pf);
-  ((rfb::SMsgHandler*)sc)->setEncodings(sizeof(encodings) / sizeof(*encodings), encodings);
+  sc->setEncoding(rfb::encodingNum(encodingParam.getValueStr().c_str()));
 }
 
 CConn::~CConn()
@@ -214,6 +232,11 @@ void CConn::getStats(double& ratio, unsigned long long& bytes,
                      unsigned long long& rawEquivalent)
 {
   sc->getStats(ratio, bytes, rawEquivalent);
+}
+
+void CConn::initDone()
+{
+  resizeFramebuffer();
 }
 
 void CConn::resizeFramebuffer()
@@ -248,10 +271,15 @@ void CConn::framebufferUpdateEnd()
   updates.getUpdateInfo(&ui, clip);
 
   startCpuCounter();
+  startTimeCounter();
   sc->writeUpdate(ui, pb);
+  endTimeCounter();
   endCpuCounter();
 
   encodeTime += getCpuCounter();
+  double frameTime = getTimeCounter() * 1000;
+  if (frameTime > maxEncodeFrameTime)
+    maxEncodeFrameTime = frameTime;
 }
 
 bool CConn::dataRect(const core::Rect& r, int encoding)
@@ -265,19 +293,11 @@ bool CConn::dataRect(const core::Rect& r, int encoding)
   return true;
 }
 
-void CConn::setColourMapEntries(int, int, uint16_t*)
-{
-}
-
 void CConn::bell()
 {
 }
 
-void CConn::serverCutText(const char*)
-{
-}
-
-void CConn::getUserPasswd(bool, std::string *, std::string *)
+void CConn::getUserPasswd(std::string *, std::string *)
 {
 }
 
@@ -317,14 +337,23 @@ void Manager::getStats(double& ratio, unsigned long long& encodedBytes,
 }
 
 SConn::SConn()
-: SConnection(rfb::AccessDefault)
+: SConnection(new network::TcpSocket(-1), rfb::AccessDefault)
 {
   out = new DummyOutStream;
   setStreams(nullptr, out);
 
-  setWriter(new rfb::SMsgWriter(&client, out));
-
   manager = new Manager(this);
+}
+
+void SConn::setEncoding(int32_t selectedEncoding)
+{
+  const int32_t encodings[] = {
+    selectedEncoding, rfb::pseudoEncodingLastRect,
+    rfb::pseudoEncodingQualityLevel0 + 8,
+    rfb::pseudoEncodingCompressLevel0 + 2
+  };
+  ((rfb::SMsgHandler*)this)->setEncodings(sizeof(encodings) / sizeof(*encodings),
+                                          encodings);
 }
 
 SConn::~SConn()
@@ -369,6 +398,7 @@ struct stats
   double ratio;
   unsigned long long bytes;
   unsigned long long rawEquivalent;
+  double maxEncodeFrameTime;
 };
 
 static struct stats runTest(const char *fn)
@@ -399,6 +429,7 @@ static struct stats runTest(const char *fn)
 
   s.decodeTime = cc->decodeTime;
   s.encodeTime = cc->encodeTime;
+  s.maxEncodeFrameTime = cc->maxEncodeFrameTime;
   s.realTime = (double)stop.tv_sec - start.tv_sec;
   s.realTime += ((double)stop.tv_usec - start.tv_usec)/1000000.0;
   cc->getStats(s.ratio, s.bytes, s.rawEquivalent);
@@ -537,6 +568,17 @@ int main(int argc, char **argv)
   meddev = dev[runCount/2];
 
   printf("CPU time (encoding): %g s (+/- %g %%)\n", median, meddev);
+
+  for (i = 0; i < runCount; i++)
+    values[i] = runs[i].maxEncodeFrameTime;
+
+  sort(values, runCount);
+  median = values[runCount/2];
+  for (i = 0; i < runCount; i++)
+    dev[i] = median == 0 ? 0 : fabs((values[i] - median) / median) * 100;
+  sort(dev, runCount);
+  meddev = dev[runCount/2];
+  printf("Max framebuffer encode time: %g ms (+/- %g %%)\n", median, meddev);
 
   // And for CPU core usage encoding
   for (i = 0;i < runCount;i++)

@@ -1,5 +1,5 @@
 /*
- *  Copyright (C) 2012-2016 Brian P. Hinz. All Rights Reserved.
+ *  Copyright (C) 2012-2026 Brian P. Hinz. All Rights Reserved.
  *  Copyright (C) 2000 Const Kaplinsky.  All Rights Reserved.
  *  Copyright (C) 1999 AT&T Laboratories Cambridge.  All Rights Reserved.
  *
@@ -25,6 +25,7 @@
 
 package com.tigervnc.vncviewer;
 
+import java.awt.GraphicsEnvironment;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStream;
@@ -32,6 +33,8 @@ import java.io.InputStreamReader;
 import java.io.IOException;
 import java.net.*;
 import java.util.*;
+import javax.swing.JOptionPane;
+import javax.swing.SwingUtilities;
 
 import com.tigervnc.rdr.*;
 import com.tigervnc.rfb.*;
@@ -52,12 +55,16 @@ public class Tunnel {
   private final static String DEFAULT_TUNNEL_TEMPLATE
     = "-f -L %L:localhost:%R %H sleep 20";
   private final static String DEFAULT_VIA_TEMPLATE
-    = "-f -L %L:%H:%R %G sleep 20";
+    = "-f -L %L:%H:%R -- %G sleep 20";
 
-  public static void createTunnel(String gatewayHost,
-                                  String remoteHost,
-                                  int remotePort,
-                                  int localPort) throws Exception {
+  // Returns the JSch Session backing the tunnel (extSSH mode has no
+  // such handle, so null in that case) -- the caller owns it and must
+  // pass it to closeTunnel() when done. A connected Session isn't
+  // reclaimed just by dropping the reference to it.
+  public static Session createTunnel(String gatewayHost,
+                                     String remoteHost,
+                                     int remotePort,
+                                     int localPort) throws Exception {
     if (extSSH.getValue()) {
       String pattern = extSSHArgs.getValueStr();
       if (pattern == null || pattern.isEmpty()) {
@@ -72,9 +79,15 @@ public class Tunnel {
         }
       }
       createTunnelExt(gatewayHost, remoteHost, remotePort, localPort, pattern);
+      return null;
     } else {
-      createTunnelJSch(gatewayHost, remoteHost, remotePort, localPort);
+      return createTunnelJSch(gatewayHost, remoteHost, remotePort, localPort);
     }
+  }
+
+  public static void closeTunnel(Session session) {
+    if (session != null)
+      session.disconnect();
   }
 
   private static class MyJSchLogger implements Logger {
@@ -142,10 +155,11 @@ public class Tunnel {
     return "";
   }
 
-  private static void createTunnelJSch(String gatewayHost, String remoteHost,
-                                       int remotePort, int localPort) throws Exception {
+  private static Session createTunnelJSch(String gatewayHost, String remoteHost,
+                                          int remotePort, int localPort) throws Exception {
     JSch.setLogger(new MyJSchLogger());
     JSch jsch=new JSch();
+    Session session = null;
 
     try {
       // NOTE: jsch does not support all ciphers.  User may be
@@ -188,18 +202,25 @@ public class Tunnel {
           OpenSSHConfig.parse(ssh_config.getAbsolutePath());
         jsch.setConfigRepository(repo);
       }
-      Session session=jsch.getSession(user, gatewayHost, getSshPort());
+      session=jsch.getSession(user, gatewayHost, getSshPort());
       session.setUserInfo(dlg);
       // OpenSSHConfig doesn't recognize StrictHostKeyChecking
       if (session.getConfig("StrictHostKeyChecking") == null)
         session.setConfig("StrictHostKeyChecking", "ask");
       session.connect();
-      if (gatewayHost.equals(remoteHost))
+      if (remoteHost.startsWith("/") || remotePort == 0) {
+        session.setSocketForwardingL("127.0.0.1", localPort, remoteHost, null, 0);
+        vlog.info("Opened SSH tunnel to Unix domain socket " + remoteHost + " on local port " + localPort);
+      } else if (gatewayHost.equals(remoteHost)) {
         session.setPortForwardingL(localPort, new String("localhost"), remotePort);
-      else
+      } else {
         session.setPortForwardingL(localPort, remoteHost, remotePort);
+      }
+      return session;
     } catch (java.lang.Exception e) {
-      throw new Exception(e.getMessage()); 
+      if (session != null)
+        session.disconnect();
+      throw new Exception(e.getMessage());
     }
   }
 
@@ -208,6 +229,51 @@ public class Tunnel {
                                       String pattern) throws Exception {
     String cmd = fillCmdPattern(pattern, gatewayHost, remoteHost,
                                 remotePort, localPort);
+
+    if (!GraphicsEnvironment.isHeadless()) {
+      int[] result = new int[] { JOptionPane.NO_OPTION };
+      try {
+        if (SwingUtilities.isEventDispatchThread()) {
+          result[0] = JOptionPane.showOptionDialog(
+            null,
+            "SECURITY WARNING:\n\n" +
+            "The connection profile is attempting to execute an external SSH command:\n\n" +
+            "  " + cmd + "\n\n" +
+            "Executing external commands may pose a security risk.\n" +
+            "Do you want to allow this external command to run?",
+            "Security Warning - External Command Execution",
+            JOptionPane.YES_NO_OPTION,
+            JOptionPane.WARNING_MESSAGE,
+            null,
+            new Object[]{"Yes", "No"},
+            "No"
+          );
+        } else {
+          SwingUtilities.invokeAndWait(() -> {
+            result[0] = JOptionPane.showOptionDialog(
+              null,
+              "SECURITY WARNING:\n\n" +
+              "The connection profile is attempting to execute an external SSH command:\n\n" +
+              "  " + cmd + "\n\n" +
+              "Executing external commands from configuration files or quick-start profiles may pose a security risk.\n" +
+              "Do you want to allow this external command to run?",
+              "Security Warning - External Command Execution",
+              JOptionPane.YES_NO_OPTION,
+              JOptionPane.WARNING_MESSAGE,
+              null,
+              new Object[]{"Yes", "No"},
+              "No"
+            );
+          });
+        }
+      } catch (java.lang.Exception e) {
+        throw new Exception("Security confirmation prompt failed: " + e.getMessage());
+      }
+      if (result[0] != JOptionPane.YES_OPTION) {
+        throw new Exception("Execution of external SSH command was cancelled by the user.");
+      }
+    }
+
     try {
       Thread t = new Thread(new ExtProcess(cmd, vlog, true));
       t.start();
@@ -287,7 +353,8 @@ public class Tunnel {
     if (pattern.length() > 1024)
       throw new Exception("Tunneling command is too long.");
 
-    if (!H_found || !R_found || !L_found)
+    boolean isUnixSocket = remoteHost.startsWith("/") || remotePort == 0;
+    if (!H_found || (!isUnixSocket && !R_found) || !L_found)
       throw new Exception("%H, %R or %L absent in tunneling command template.");
 
     if (!tunnel.getValue() && !G_found)

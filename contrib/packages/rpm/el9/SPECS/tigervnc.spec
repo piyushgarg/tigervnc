@@ -24,7 +24,9 @@ BuildRequires:  freetype-devel, libjpeg-turbo-devel, pam-devel
 BuildRequires:  gnutls-devel, nettle-devel, gmp-devel
 BuildRequires:  zlib-devel
 BuildRequires:  libuuid-devel, glib2-devel, pipewire-devel
+BuildRequires:  pulseaudio-libs-devel
 BuildRequires:  wayland-devel, libxkbcommon-devel
+BuildRequires:  libpwquality-devel
 # X11/graphics dependencies
 BuildRequires: xorg-x11-server-source
 BuildRequires: libXext-devel, libX11-devel, libXi-devel, libXfixes-devel
@@ -42,9 +44,7 @@ BuildRequires:  systemd-devel
 BuildRequires:  fltk-devel >= 1.3.3
 BuildRequires:  xorg-x11-server-devel
 
-Requires:       hicolor-icon-theme
-Requires:       tigervnc-license
-Requires:       tigervnc-icons
+Requires:       tigervnc-common
 
 %description
 Virtual Network Computing (VNC) is a remote display system which
@@ -78,7 +78,7 @@ Requires(postun): systemd
 Requires(post): systemd
 
 Requires:       mesa-dri-drivers, xkeyboard-config, xkbcomp
-Requires:       tigervnc-license, dbus-x11
+Requires:       tigervnc-common, dbus-x11
 
 %description server-minimal
 The VNC system allows you to access the same desktop from a wide
@@ -89,25 +89,24 @@ machine.
 %package server-module
 Summary:        TigerVNC module to Xorg
 Requires:       xorg-x11-server-Xorg %(xserver-sdk-abi-requires ansic) %(xserver-sdk-abi-requires videodrv)
-Requires:       tigervnc-license
+Requires:       tigervnc-common
 
 %description server-module
 This package contains libvnc.so module to X server, allowing others
 to access the desktop on your machine.
 
-%package license
-Summary:        License of TigerVNC suite
+%package common
+Summary:        Shared TigerVNC files
 BuildArch:      noarch
 
-%description license
-This package contains license of the TigerVNC suite
+Requires:       hicolor-icon-theme
 
-%package icons
-Summary:        Icons for TigerVNC viewer
-BuildArch:      noarch
+Obsoletes:      tigervnc-license <= %{version}-%{release}
+Obsoletes:      tigervnc-icons <= %{version}-%{release}
 
-%description icons
-This package contains icons for TigerVNC viewer
+%description common
+This package contains files that are used by multiple components of the
+TigerVNC suite.
 
 %package selinux
 Summary:        SELinux module for TigerVNC
@@ -135,20 +134,16 @@ patch -p1 -b --suffix .vnc < "$xserver_patch"
 popd
 
 %build
-%ifarch sparcv9 sparc64 s390 s390x
-export CFLAGS="$RPM_OPT_FLAGS -fPIC"
-%else
-export CFLAGS="$RPM_OPT_FLAGS -fpic"
-%endif
-export CXXFLAGS="$CFLAGS -std=c++11"
-
 %cmake \
   -DENABLE_NLS=ON \
   -DENABLE_GNUTLS=ON \
   -DENABLE_NETTLE=ON \
+  -DENABLE_PAM=ON \
   -DENABLE_SELINUX=ON \
   -DENABLE_SYSTEMD=ON \
+  -DENABLE_PWQUALITY=ON \
   -DENABLE_WAYLAND=ON \
+  -DENABLE_AUDIO=ON \
   -DBUILD_VIEWER=ON
 
 %cmake_build
@@ -212,7 +207,7 @@ if [ $1 -eq 0 ]; then
 fi
 
 
-%files -f %{name}.lang
+%files
 %doc %{_docdir}/%{name}/README.rst
 %{_bindir}/vncviewer
 %{_datadir}/applications/*
@@ -250,10 +245,8 @@ fi
 %{_libdir}/xorg/modules/extensions/libvnc.so
 %config(noreplace) %{_sysconfdir}/X11/xorg.conf.d/10-libvnc.conf
 
-%files license
+%files common -f %{name}.lang
 %doc %{_docdir}/%{name}/LICENCE.TXT
-
-%files icons
 %{_datadir}/icons/hicolor/*/apps/*
 
 %files selinux
@@ -261,6 +254,9 @@ fi
 %ghost %verify(not md5 size mtime) %{_sharedstatedir}/selinux/%{selinuxtype}/active/modules/200/%{modulename}
 
 %changelog
+* Mon Jul 28 2025 Pierre Ossman <ossman@cendio.se> 1.15.80-1
+- Replaced license and icons package with a common package.
+
 * Fri Aug 19 2022 Pierre Ossman <ossman@cendio.se> 1.12.80-1
 - Synced with current Fedora packaging
 

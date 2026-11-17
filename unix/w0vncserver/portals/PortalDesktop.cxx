@@ -27,6 +27,7 @@
 #include <rfb/ScreenSet.h>
 #include <rfb/VNCServerST.h>
 #include <core/LogWriter.h>
+#include <core/i18n.h>
 #include <core/xdgdirs.h>
 #include <core/string.h>
 
@@ -68,8 +69,9 @@ void PortalDesktop::start()
     try {
       pb = new PipeWirePixelBuffer(fd, id, server);
     } catch (std::exception& e) {
-      server->closeClients(core::format("error initializing PipeWirePixelBuffer: %s",
-                                        e.what()).c_str());
+      server->closeClients(
+        core::format(_("Failed to create PipeWire pixel buffer: %s"),
+                     e.what()).c_str());
     }
   };
 
@@ -105,7 +107,8 @@ void PortalDesktop::start()
     try {
       clipboard->requestClipboard();
     } catch (std::exception& e) {
-      vlog.error("Could not get clipboard access");
+      vlog.error(_("Failed to initialize clipboard access: %s"),
+                 e.what());
       clipboardAccess = false;
     }
   };
@@ -121,8 +124,9 @@ void PortalDesktop::start()
                                       cancelStart, initClipboard,
                                       clipboardSubscribe);
   } catch (std::exception& e) {
-    vlog.error("error initializing RemoteDesktop: %s", e.what());
-    server->closeClients("Failed to start remote desktop session");
+    vlog.error(_("Failed to start remote desktop session: %s"),
+               e.what());
+    server->closeClients(_("Failed to start remote desktop session"));
     return;
   }
 
@@ -145,12 +149,12 @@ void PortalDesktop::stop()
   clipboardAccess = false;
 }
 
-void PortalDesktop::queryConnection(network::Socket* sock,
-                                    const char* /* userName */)
+void PortalDesktop::queryConnection(rfb::SConnection* conn)
 {
   // FIXME: Implement this.
-  server->approveConnection(sock, false,
-                            "Unable to query the local user to accept the connection.");
+  server->approveConnection(conn, false,
+                            _("Unable to query the local user to "
+                              "accept the connection."));
 }
 
 void PortalDesktop::terminate()

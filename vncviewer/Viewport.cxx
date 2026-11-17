@@ -28,6 +28,7 @@
 #include <stdexcept>
 
 #include <core/LogWriter.h>
+#include <core/i18n.h>
 #include <core/string.h>
 
 #include <rfb/CMsgWriter.h>
@@ -52,7 +53,6 @@
 #include "CConn.h"
 #include "OptionsDialog.h"
 #include "DesktopWindow.h"
-#include "i18n.h"
 #include "parameters.h"
 #include "vncviewer.h"
 
@@ -171,12 +171,6 @@ Viewport::~Viewport()
 
   // FLTK automatically deletes all child widgets, so we shouldn't touch
   // them ourselves here
-}
-
-
-const rfb::PixelFormat &Viewport::getPreferredPF()
-{
-  return frameBuffer->getPF();
 }
 
 
@@ -432,14 +426,14 @@ int Viewport::handle(int event)
   switch (event) {
   case FL_PASTE:
     if (!core::isValidUTF8(Fl::event_text(), Fl::event_length())) {
-      vlog.error("Invalid UTF-8 sequence in system clipboard");
+      vlog.error(_("Invalid UTF-8 sequence in clipboard"));
       // Reset the state as if we don't have any clipboard data at all
       this->pendingClientClipboard = false;
       try {
         this->cc->announceClipboard(false);
       } catch (std::exception& e) {
         vlog.error("%s", e.what());
-        abort_connection_with_unexpected_error(e);
+        abort_connection_unexpected(e);
       }
       return 1;
     }
@@ -452,7 +446,7 @@ int Viewport::handle(int event)
       cc->sendClipboardData(filtered.c_str());
     } catch (std::exception& e) {
       vlog.error("%s", e.what());
-      abort_connection_with_unexpected_error(e);
+      abort_connection_unexpected(e);
     }
 
     return 1;
@@ -553,10 +547,10 @@ void Viewport::sendPointerEvent(const core::Point& pos,
 
   if ((pointerEventInterval == 0) || (buttonMask != lastButtonMask)) {
     try {
-      cc->writer()->writePointerEvent(pos, buttonMask);
+      cc->sendPointerEvent(pos, buttonMask);
     } catch (std::exception& e) {
       vlog.error("%s", e.what());
-      abort_connection_with_unexpected_error(e);
+      abort_connection_unexpected(e);
     }
   } else {
     if (!Fl::has_timeout(handlePointerTimeout, this))
@@ -595,7 +589,22 @@ void Viewport::handleClipboardChange(int source, void *data)
     return;
 #endif
 
-  if (!Fl::clipboard_contains(Fl::clipboard_plain_text)) {
+  if (!self->hasFocus()) {
+    vlog.debug("Local clipboard changed whilst not focused, will notify server later");
+    self->clipboardSource = source;
+    self->pendingClientClipboard = true;
+    // Clear any older client clipboard from the server
+    try {
+      self->cc->announceClipboard(false);
+    } catch (std::exception& e) {
+      vlog.error("%s", e.what());
+      abort_connection_unexpected(e);
+    }
+    return;
+  }
+
+  if (source != 0 &&
+      !Fl::clipboard_contains(Fl::clipboard_plain_text)) {
     vlog.debug("Got non-plain text in local clipboard, ignoring.");
     // Reset the state as if we don't have any clipboard data at all
     self->pendingClientClipboard = false;
@@ -603,32 +612,19 @@ void Viewport::handleClipboardChange(int source, void *data)
       self->cc->announceClipboard(false);
     } catch (std::exception& e) {
       vlog.error("%s", e.what());
-      abort_connection_with_unexpected_error(e);
+      abort_connection_unexpected(e);
     }
     return;
   }
 
   self->clipboardSource = source;
 
-  if (!self->hasFocus()) {
-    vlog.debug("Local clipboard changed whilst not focused, will notify server later");
-    self->pendingClientClipboard = true;
-    // Clear any older client clipboard from the server
-    try {
-      self->cc->announceClipboard(false);
-    } catch (std::exception& e) {
-      vlog.error("%s", e.what());
-      abort_connection_with_unexpected_error(e);
-    }
-    return;
-  }
-
   vlog.debug("Local clipboard changed, notifying server");
   try {
     self->cc->announceClipboard(true);
   } catch (std::exception& e) {
     vlog.error("%s", e.what());
-    abort_connection_with_unexpected_error(e);
+    abort_connection_unexpected(e);
   }
 }
 
@@ -636,12 +632,19 @@ void Viewport::handleClipboardChange(int source, void *data)
 void Viewport::flushPendingClipboard()
 {
   if (pendingClientClipboard) {
+    if (clipboardSource != 0 &&
+        !Fl::clipboard_contains(Fl::clipboard_plain_text)) {
+      vlog.debug("Pending local clipboard has no plain text, ignoring.");
+      pendingClientClipboard = false;
+      return;
+    }
+
     vlog.debug("Focus regained after local clipboard change, notifying server");
     try {
       cc->announceClipboard(true);
     } catch (std::exception& e) {
       vlog.error("%s", e.what());
-      abort_connection_with_unexpected_error(e);
+      abort_connection_unexpected(e);
     }
   }
 
@@ -663,11 +666,11 @@ void Viewport::handlePointerTimeout(void *data)
   assert(self);
 
   try {
-    self->cc->writer()->writePointerEvent(self->lastPointerPos,
-                                          self->lastButtonMask);
+    self->cc->sendPointerEvent(self->lastPointerPos,
+                               self->lastButtonMask);
   } catch (std::exception& e) {
     vlog.error("%s", e.what());
-    abort_connection_with_unexpected_error(e);
+    abort_connection_unexpected(e);
   }
 }
 
@@ -678,7 +681,7 @@ void Viewport::resetKeyboard()
     cc->releaseAllKeys();
   } catch (std::exception& e) {
     vlog.error("%s", e.what());
-    abort_connection_with_unexpected_error(e);
+    abort_connection_unexpected(e);
   }
 
   keyboard->reset();
@@ -825,7 +828,7 @@ void Viewport::sendKeyPress(int systemKeyCode,
     cc->sendKeyPress(systemKeyCode, keyCode, keySym);
   } catch (std::exception& e) {
     vlog.error("%s", e.what());
-    abort_connection_with_unexpected_error(e);
+    abort_connection_unexpected(e);
   }
 }
 
@@ -892,7 +895,7 @@ void Viewport::sendKeyRelease(int systemKeyCode)
     cc->sendKeyRelease(systemKeyCode);
   } catch (std::exception& e) {
     vlog.error("%s", e.what());
-    abort_connection_with_unexpected_error(e);
+    abort_connection_unexpected(e);
   }
 }
 
@@ -927,37 +930,37 @@ void Viewport::initContextMenu()
 {
   contextMenu->clear();
 
-  fltk_menu_add(contextMenu, p_("ContextMenu|", "Disconn&ect"),
+  fltk_menu_add(contextMenu, C_("ContextMenu|", "Disconn&ect"),
                 0, nullptr, (void*)ID_DISCONNECT, FL_MENU_DIVIDER);
 
-  fltk_menu_add(contextMenu, p_("ContextMenu|", "&Full screen"),
+  fltk_menu_add(contextMenu, C_("ContextMenu|", "&Full screen"),
                 0, nullptr, (void*)ID_FULLSCREEN,
                 FL_MENU_TOGGLE | (window()->fullscreen_active()?FL_MENU_VALUE:0));
-  fltk_menu_add(contextMenu, p_("ContextMenu|", "Minimi&ze"),
+  fltk_menu_add(contextMenu, C_("ContextMenu|", "Minimi&ze"),
                 0, nullptr, (void*)ID_MINIMIZE, 0);
-  fltk_menu_add(contextMenu, p_("ContextMenu|", "Resize &window to session"),
+  fltk_menu_add(contextMenu, C_("ContextMenu|", "Resize &window to session"),
                 0, nullptr, (void*)ID_RESIZE,
                 (window()->fullscreen_active()?FL_MENU_INACTIVE:0) |
                 FL_MENU_DIVIDER);
 
-  fltk_menu_add(contextMenu, p_("ContextMenu|", "&Ctrl"),
+  fltk_menu_add(contextMenu, C_("ContextMenu|", "&Ctrl"),
                 0, nullptr, (void*)ID_CTRL,
                 FL_MENU_TOGGLE | (menuCtrlKey?FL_MENU_VALUE:0));
-  fltk_menu_add(contextMenu, p_("ContextMenu|", "&Alt"),
+  fltk_menu_add(contextMenu, C_("ContextMenu|", "&Alt"),
                 0, nullptr, (void*)ID_ALT,
                 FL_MENU_TOGGLE | (menuAltKey?FL_MENU_VALUE:0));
 
-  fltk_menu_add(contextMenu, p_("ContextMenu|", "Send Ctrl-Alt-&Del"),
+  fltk_menu_add(contextMenu, C_("ContextMenu|", "Send Ctrl-Alt-&Del"),
                 0, nullptr, (void*)ID_CTRLALTDEL, FL_MENU_DIVIDER);
 
-  fltk_menu_add(contextMenu, p_("ContextMenu|", "&Refresh screen"),
+  fltk_menu_add(contextMenu, C_("ContextMenu|", "&Refresh screen"),
                 0, nullptr, (void*)ID_REFRESH, FL_MENU_DIVIDER);
 
-  fltk_menu_add(contextMenu, p_("ContextMenu|", "&Options..."),
+  fltk_menu_add(contextMenu, C_("ContextMenu|", "&Options..."),
                 0, nullptr, (void*)ID_OPTIONS, 0);
-  fltk_menu_add(contextMenu, p_("ContextMenu|", "Connection &info..."),
+  fltk_menu_add(contextMenu, C_("ContextMenu|", "Connection &info..."),
                 0, nullptr, (void*)ID_INFO, 0);
-  fltk_menu_add(contextMenu, p_("ContextMenu|", "About &TigerVNC..."),
+  fltk_menu_add(contextMenu, C_("ContextMenu|", "About &TigerVNC..."),
                 0, nullptr, (void*)ID_ABOUT, 0);
 }
 #pragma GCC diagnostic pop
@@ -1007,7 +1010,7 @@ void Viewport::popupContextMenu()
     // FIXME: Workaround for not being able to minimize in fullscreen
     // https://github.com/TigerVNC/tigervnc/pull/1813
     if (window()->fullscreen_active())
-      window()->fullscreen_off();
+      cocoa_enable_minimize(window());
 #endif
     window()->iconize();
     break;

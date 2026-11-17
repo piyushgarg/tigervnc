@@ -1,5 +1,5 @@
 /* Copyright (C) 2012,2014 Brian P. Hinz
- * Copyright (C) 2012 D. R. Commander.  All Rights Reserved.
+ * Copyright (C) 2012,2026 D. R. Commander.  All Rights Reserved.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -25,6 +25,7 @@ import javax.net.ssl.SSLEngineResult.*;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 
+import com.tigervnc.rdr.EndOfStream;
 import com.tigervnc.rdr.FdInStream;
 import com.tigervnc.rdr.FdOutStream;
 
@@ -53,7 +54,7 @@ public class SSLEngineManager {
     peerNetData = ByteBuffer.allocate(pktBufSize);
   }
 
-  public void doHandshake() throws Exception {
+  public synchronized void doHandshake() throws Exception {
 
     // Begin handshake
     engine.beginHandshake();
@@ -87,7 +88,7 @@ public class SSLEngineManager {
             break;
           case CLOSED:
             engine.closeInbound();
-            break;
+            throw new SSLException("TLS connection closed during handshake");
         }
         break;
 
@@ -104,9 +105,12 @@ public class SSLEngineManager {
             os.flush();
             myNetData.compact();
             break;
+          case BUFFER_OVERFLOW:
+            myNetData = growPacketBuffer(myNetData);
+            break;
           case CLOSED:
             engine.closeOutbound();
-            break;
+            throw new SSLException("TLS connection closed during handshake");
         }
         break;
 
@@ -119,59 +123,116 @@ public class SSLEngineManager {
     }
   }
 
+  private ByteBuffer growPacketBuffer(ByteBuffer buf) {
+    int want = engine.getSession().getPacketBufferSize();
+    if (want <= buf.capacity())
+      want = buf.capacity() * 2;
+    ByteBuffer nb = ByteBuffer.allocate(want);
+    buf.flip();
+    nb.put(buf);
+    return nb;
+  }
+
   private void executeTasks() {
     Runnable task;
     while ((task = engine.getDelegatedTask()) != null) {
-      executor.execute(task);
+      task.run();
+    }
+  }
+
+  private void processHandshakeStatus(SSLEngineResult.HandshakeStatus hs) throws IOException {
+    while (hs == SSLEngineResult.HandshakeStatus.NEED_TASK ||
+           hs == SSLEngineResult.HandshakeStatus.NEED_WRAP) {
+      if (hs == SSLEngineResult.HandshakeStatus.NEED_TASK) {
+        executeTasks();
+      } else if (hs == SSLEngineResult.HandshakeStatus.NEED_WRAP) {
+        ByteBuffer empty = ByteBuffer.allocate(0);
+        SSLEngineResult wrapRes = engine.wrap(empty, myNetData);
+        switch (wrapRes.getStatus()) {
+        case OK:
+          myNetData.flip();
+          synchronized (os) {
+            os.writeBytes(myNetData, myNetData.remaining());
+            os.flush();
+          }
+          myNetData.compact();
+          break;
+        case BUFFER_OVERFLOW:
+          myNetData = growPacketBuffer(myNetData);
+          break;
+        case CLOSED:
+          engine.closeOutbound();
+          throw new EndOfStream();
+        }
+      }
+      hs = engine.getHandshakeStatus();
     }
   }
 
   public int read(ByteBuffer data, int length) throws IOException {
-    // Read SSL/TLS encoded data from peer
-    peerNetData.flip();
-    SSLEngineResult res = engine.unwrap(peerNetData, data);
-    peerNetData.compact();
-    switch (res.getStatus()) {
-      case OK :
+    synchronized(this) {
+      processHandshakeStatus(engine.getHandshakeStatus());
+
+      // Read SSL/TLS encoded data from peer
+      peerNetData.flip();
+      SSLEngineResult res = engine.unwrap(peerNetData, data);
+      peerNetData.compact();
+
+      processHandshakeStatus(res.getHandshakeStatus());
+
+      if (res.getStatus() == SSLEngineResult.Status.OK) {
         return res.bytesProduced();
-
-      case BUFFER_UNDERFLOW:
-        // attempt to drain the underlying buffer first
-        int need = peerNetData.remaining();
-        in.readBytes(peerNetData, in.check(1, need, true));
-        break;
-
-      case CLOSED:
+      } else if (res.getStatus() == SSLEngineResult.Status.CLOSED) {
+        if (res.bytesProduced() > 0)
+          return res.bytesProduced();
         engine.closeInbound();
-        break;
+        throw new EndOfStream();
+      }
+    }
 
+    // BUFFER_UNDERFLOW: Perform blocking network read OUTSIDE synchronized block!
+    int need;
+    synchronized(this) {
+      need = peerNetData.remaining();
+    }
+    int avail = in.check(1, need, true);
+    if (avail > 0) {
+      synchronized(this) {
+        in.readBytes(peerNetData, avail);
+      }
     }
     return 0;
   }
 
-  public int write(ByteBuffer data, int length) throws IOException {
+  public synchronized int write(ByteBuffer data, int length) throws IOException {
     int n = 0;
     while (data.hasRemaining()) {
+      processHandshakeStatus(engine.getHandshakeStatus());
       SSLEngineResult res = engine.wrap(data, myNetData);
       n += res.bytesConsumed();
+      processHandshakeStatus(res.getHandshakeStatus());
       switch (res.getStatus()) {
         case OK:
           myNetData.flip();
-          os.writeBytes(myNetData, myNetData.remaining());
-          os.flush();
+          synchronized (os) {
+            os.writeBytes(myNetData, myNetData.remaining());
+            os.flush();
+          }
           myNetData.compact();
           break;
 
         case BUFFER_OVERFLOW:
           // Make room in the buffer by flushing the outstream
           myNetData.flip();
-          os.writeBytes(myNetData, myNetData.remaining());
+          synchronized (os) {
+            os.writeBytes(myNetData, myNetData.remaining());
+          }
           myNetData.compact();
           break;
 
         case CLOSED:
           engine.closeOutbound();
-          break;
+          throw new EndOfStream();
       }
     }
     return n;

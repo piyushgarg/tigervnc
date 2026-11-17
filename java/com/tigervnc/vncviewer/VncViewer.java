@@ -290,6 +290,8 @@ public class VncViewer implements Runnable {
                                 (serverName.indexOf('\\')) != -1);
 
     if (hasPathSeparator) {
+      if (com.tigervnc.rfb.Hostname.isUnixSocket(serverName))
+        return;
       try {
         serverName = loadViewerParameters(vncServerName.toString());
         if (serverName == "") {
@@ -299,6 +301,8 @@ public class VncViewer implements Runnable {
         vncServerName.clear();
         vncServerName.put(serverName).flip();
       } catch (com.tigervnc.rfb.Exception e) {
+        if (com.tigervnc.rfb.Hostname.isUnixSocket(vncServerName.toString()))
+          return;
         vlog.info(e.getMessage());
         System.exit(1);
       }
@@ -436,19 +440,44 @@ public class VncViewer implements Runnable {
       }
     }
 
-    try {
-      cc = new CConn(vncServerName.toString(), sock);
-      while (!cc.shuttingDown)
-        cc.processMsg();
-      exit(0);
-    } catch (java.lang.Exception e) {
-      if (cc == null || !cc.shuttingDown) {
-        reportException(e);
-        if (cc != null)
+    mainloop(vncServerName.toString(), sock);
+  }
+
+  public static boolean exitMainloop = false;
+
+  private void mainloop(String vncserver, Socket sock) {
+    while (!exitMainloop) {
+      try {
+        cc = new CConn(vncserver, sock);
+        while (!exitMainloop && !cc.shuttingDown) {
+          Fl.wait(0.1);
+        }
+        cc.close();
+        break;
+      } catch (java.lang.Exception e) {
+        if (cc != null) {
           cc.close();
+          cc = null;
+        }
+
+        if (reconnectOnError.getValue() && sock == null && !exitMainloop) {
+          String errMsg = e.getMessage() != null && !e.getMessage().isEmpty() ?
+                          e.getMessage() : "Connection failure";
+          String prompt = String.format("%s\n\nAttempt to reconnect?", errMsg);
+          int choice = JOptionPane.showConfirmDialog(null, prompt, "TigerVNC Error",
+                                                     JOptionPane.YES_NO_OPTION,
+                                                     JOptionPane.ERROR_MESSAGE);
+          if (choice == JOptionPane.YES_OPTION) {
+            continue;
+          }
+        }
+
+        UserDialog.clearSavedCredentials();
+        reportException(e);
+        exit(1);
       }
-      exit(1);
     }
+    exit(0);
   }
 
   static void migrateDeprecatedOptions() {

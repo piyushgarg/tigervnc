@@ -36,6 +36,8 @@ extern "C" {
 #define FFMPEG_INIT_PACKET_DEPRECATED
 #endif
 
+#include <core/i18n.h>
+
 #include <rfb/PixelBuffer.h>
 #include <rfb/H264LibavDecoderContext.h>
 
@@ -50,17 +52,17 @@ H264LibavDecoderContext::H264LibavDecoderContext(const core::Rect& r)
 
   const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
   if (!codec)
-    throw std::runtime_error("Codec not found");
+    throw std::runtime_error(_("Could not find video codec"));
 
   parser = av_parser_init(codec->id);
   if (!parser)
-    throw std::runtime_error("Could not create H264 parser");
+    throw std::runtime_error(_("Could not create video parser"));
 
   avctx = avcodec_alloc_context3(codec);
   if (!avctx)
   {
     av_parser_close(parser);
-    throw std::runtime_error("Could not allocate video codec context");
+    throw std::runtime_error(_("Could not allocate video codec context"));
   }
 
   frame = av_frame_alloc();
@@ -68,7 +70,7 @@ H264LibavDecoderContext::H264LibavDecoderContext(const core::Rect& r)
   {
     av_parser_close(parser);
     avcodec_free_context(&avctx);
-    throw std::runtime_error("Could not allocate video frame");
+    throw std::runtime_error(_("Could not allocate video frame"));
   }
 
   if (avcodec_open2(avctx, codec, nullptr) < 0)
@@ -76,7 +78,7 @@ H264LibavDecoderContext::H264LibavDecoderContext(const core::Rect& r)
     av_parser_close(parser);
     avcodec_free_context(&avctx);
     av_frame_free(&frame);
-    throw std::runtime_error("Could not open video codec");
+    throw std::runtime_error(_("Could not open video codec"));
   }
 }
 
@@ -95,7 +97,7 @@ H264LibavDecoderContext::~H264LibavDecoderContext()
 // Also avcodec requires a right padded buffer
 uint8_t* H264LibavDecoderContext::makeH264WorkBuffer(const uint8_t* buffer, uint32_t len)
 {
-  uint32_t reserve_len = len + len % AV_INPUT_BUFFER_PADDING_SIZE;
+  uint32_t reserve_len = len + AV_INPUT_BUFFER_PADDING_SIZE;
 
   if (!h264WorkBuffer || reserve_len > h264WorkBufferLength)
   {
@@ -183,7 +185,7 @@ void H264LibavDecoderContext::decode(const uint8_t* h264_in_buffer,
   if (!frames_received)
     return;
 
-  if (!frame->height)
+  if ((frame->width < rect.width()) || (frame->height < rect.height()))
     return;
 
   sws = sws_getCachedContext(sws, frame->width, frame->height, avctx->pix_fmt,

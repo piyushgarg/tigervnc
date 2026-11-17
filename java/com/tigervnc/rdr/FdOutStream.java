@@ -57,6 +57,11 @@ public class FdOutStream extends OutStream {
     return offset + ptr - sentUpTo;
   }
 
+  public boolean hasBufferedData()
+  {
+    return length() > 0;
+  }
+
   int bufferUsage()
   {
     return ptr - sentUpTo;
@@ -67,7 +72,7 @@ public class FdOutStream extends OutStream {
     return System.currentTimeMillis()-lastWrite;
   }
 
-  public void flush()
+  public synchronized void flush()
   {
     while (sentUpTo < ptr) {
       int n = writeWithTimeout(b, sentUpTo,
@@ -92,7 +97,7 @@ public class FdOutStream extends OutStream {
       ptr = sentUpTo = start;
   }
 
-  protected int overrun(int itemSize, int nItems)
+  protected synchronized int overrun(int itemSize, int nItems)
   {
     if (itemSize > bufSize)
       throw new Exception("FdOutStream overrun: max itemSize exceeded");
@@ -129,7 +134,7 @@ public class FdOutStream extends OutStream {
     return nItems;
   }
 
-  private int writeWithTimeout(byte[] data, int dataPtr, int length, int timeoutms)
+  private synchronized int writeWithTimeout(byte[] data, int dataPtr, int length, int timeoutms)
   {
     int n;
 
@@ -137,7 +142,7 @@ public class FdOutStream extends OutStream {
 
       Integer tv;
       if (timeoutms != -1) {
-        tv = new Integer(timeoutms);
+        tv = Integer.valueOf(timeoutms);
       } else {
         tv = null;
       }

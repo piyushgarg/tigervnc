@@ -56,12 +56,14 @@ namespace rfb {
                        const uint8_t data[]) = 0;
     virtual void endOfContinuousUpdates() = 0;
     virtual void supportsQEMUKeyEvent() = 0;
+    virtual void supportsQEMUAudio() = 0;
     virtual void supportsExtendedMouseButtons() = 0;
     virtual void serverInit(int width, int height,
                             const PixelFormat& pf,
                             const char* name) = 0;
 
     virtual bool readAndDecodeRect(const core::Rect& r, int encoding,
+                                   const PixelFormat& pf,
                                    ModifiablePixelBuffer* pb) = 0;
 
     virtual void framebufferUpdateStart() = 0;
@@ -75,14 +77,18 @@ namespace rfb {
 
     virtual void setLEDState(unsigned int state) = 0;
 
-    virtual void handleClipboardCaps(uint32_t flags,
-                                     const uint32_t* lengths) = 0;
-    virtual void handleClipboardRequest(uint32_t flags) = 0;
-    virtual void handleClipboardPeek() = 0;
-    virtual void handleClipboardNotify(uint32_t flags) = 0;
-    virtual void handleClipboardProvide(uint32_t flags,
-                                        const size_t* lengths,
-                                        const uint8_t* const* data) = 0;
+    virtual void clipboardCaps(uint32_t flags,
+                               const uint32_t* lengths) = 0;
+    virtual void clipboardRequest(uint32_t flags) = 0;
+    virtual void clipboardPeek() = 0;
+    virtual void clipboardNotify(uint32_t flags) = 0;
+    virtual void clipboardProvide(uint32_t flags,
+                                  const size_t* lengths,
+                                  const uint8_t* const* data) = 0;
+
+    virtual void audioBegin() = 0;
+    virtual void audioEnd() = 0;
+    virtual void audioData(const uint8_t* data, size_t length) = 0;
 
     ServerParams server;
   };

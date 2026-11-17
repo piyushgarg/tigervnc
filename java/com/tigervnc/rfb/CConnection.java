@@ -1,5 +1,5 @@
 /* Copyright (C) 2002-2005 RealVNC Ltd.  All Rights Reserved.
- * Copyright (C) 2011-2019 Brian P. Hinz
+ * Copyright (C) 2011-2026 Brian P. Hinz
  *
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -48,8 +48,190 @@ abstract public class CConnection extends CMsgHandler {
     formatChange = false; encodingChange = false;
     firstUpdate = true; pendingUpdate = false; continuousUpdates = false;
     forceNonincremental = true;
-    framebuffer = null; decoder = new DecodeManager(this);
+    framebuffer = null; decoder = null;
     security = new SecurityClient();
+    hasLocalClipboard = false; hasRemoteClipboard = false;
+    unsolicitedClipboardAttempt = false; serverClipboard = null;
+  }
+
+  public void close() {
+    if (decoder != null) {
+      decoder.stop();
+      decoder = null;
+    }
+  }
+
+  // -=- Clipboard
+
+  // requestClipboard() will result in a request to the server to
+  // transfer its clipboard data. A call to handleClipboardData() will
+  // be made once the data is available.
+  public void requestClipboard()
+  {
+    if (hasRemoteClipboard) {
+      handleClipboardData(serverClipboard);
+      return;
+    }
+
+    if ((server.clipboardFlags() & ClipboardTypes.clipboardRequest) != 0)
+      writer().writeClipboardRequest(ClipboardTypes.clipboardUTF8);
+  }
+
+  // announceClipboard() informs the server of changes to the local
+  // clipboard. Depending on what the server supports, this will result
+  // in either an immediate request for the data via
+  // handleClipboardRequest(), or a notification the server can later
+  // request with requestClipboard()/handleClipboardRequest(int).
+  public void announceClipboard(boolean available)
+  {
+    hasLocalClipboard = available;
+    unsolicitedClipboardAttempt = false;
+
+    // Attempt an unsolicited transfer?
+    if (available &&
+        (server.clipboardSize(ClipboardTypes.clipboardUTF8) > 0) &&
+        (server.clipboardFlags() & ClipboardTypes.clipboardProvide) != 0) {
+      vlog.debug("Attempting unsolicited clipboard transfer...");
+      unsolicitedClipboardAttempt = true;
+      handleClipboardRequest();
+      return;
+    }
+
+    if ((server.clipboardFlags() & ClipboardTypes.clipboardNotify) != 0) {
+      writer().writeClipboardNotify(available ? ClipboardTypes.clipboardUTF8 : 0);
+      return;
+    }
+
+    if (available)
+      handleClipboardRequest();
+  }
+
+  // sendClipboardData() transfers the actual clipboard data to the
+  // server, either because we requested it, or unprompted because we
+  // wanted to announce our own clipboard via announceClipboard().
+  public void sendClipboardData(String data)
+  {
+    if ((server.clipboardFlags() & ClipboardTypes.clipboardProvide) != 0) {
+      byte[] utf8 = convertCRLF(data).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      // Include a null terminator, matching the C++ implementation.
+      byte[] payload = Arrays.copyOf(utf8, utf8.length + 1);
+      int[] sizes = { payload.length };
+      byte[][] datas = { payload };
+
+      if (unsolicitedClipboardAttempt) {
+        unsolicitedClipboardAttempt = false;
+        if (sizes[0] > server.clipboardSize(ClipboardTypes.clipboardUTF8)) {
+          vlog.debug("Clipboard was too large for unsolicited clipboard transfer");
+          if ((server.clipboardFlags() & ClipboardTypes.clipboardNotify) != 0)
+            writer().writeClipboardNotify(ClipboardTypes.clipboardUTF8);
+          return;
+        }
+      }
+
+      writer().writeClipboardProvide(ClipboardTypes.clipboardUTF8, sizes, datas);
+    } else {
+      writer().writeClientCutText(data, data.length());
+    }
+  }
+
+  // Hooks for a subclass (viewer) to override.
+
+  // handleClipboardRequest() is called whenever the server requests
+  // the client to send over its clipboard data. It is only called
+  // after the client has first announced a clipboard change via
+  // announceClipboard().
+  protected void handleClipboardRequest() { }
+
+  // handleClipboardAnnounce() is called to indicate that the server
+  // clipboard has changed, and is now either available or not
+  // available.
+  protected void handleClipboardAnnounce(boolean available) { }
+
+  // handleClipboardData() is called when the server has sent over
+  // the clipboard data as a result of a previous call to
+  // requestClipboard().
+  protected void handleClipboardData(String data) { }
+
+  public void serverCutText(String str, int len)
+  {
+    hasLocalClipboard = false;
+
+    serverClipboard = str;
+    hasRemoteClipboard = true;
+
+    handleClipboardAnnounce(true);
+  }
+
+  public void handleClipboardCaps(int flags, int[] lengths)
+  {
+    server.setClipboardCaps(flags, lengths);
+
+    writer().writeClipboardCaps(ClipboardTypes.clipboardUTF8 |
+                                ClipboardTypes.clipboardRequest |
+                                ClipboardTypes.clipboardPeek |
+                                ClipboardTypes.clipboardNotify |
+                                ClipboardTypes.clipboardProvide,
+                                new int[]{ 0 });
+  }
+
+  public void handleClipboardRequest(int flags)
+  {
+    if ((flags & ClipboardTypes.clipboardUTF8) == 0) {
+      vlog.debug("Ignoring clipboard request for unsupported formats 0x"+
+                Integer.toHexString(flags));
+      return;
+    }
+    if (!hasLocalClipboard) {
+      vlog.debug("Ignoring unexpected clipboard request");
+      return;
+    }
+    handleClipboardRequest();
+  }
+
+  public void handleClipboardPeek()
+  {
+    if ((server.clipboardFlags() & ClipboardTypes.clipboardNotify) != 0)
+      writer().writeClipboardNotify(hasLocalClipboard ? ClipboardTypes.clipboardUTF8 : 0);
+  }
+
+  public void handleClipboardNotify(int flags)
+  {
+    hasRemoteClipboard = false;
+
+    if ((flags & ClipboardTypes.clipboardUTF8) != 0) {
+      hasLocalClipboard = false;
+      handleClipboardAnnounce(true);
+    } else {
+      handleClipboardAnnounce(false);
+    }
+  }
+
+  public void handleClipboardProvide(int flags, int[] lengths, byte[][] data)
+  {
+    if ((flags & ClipboardTypes.clipboardUTF8) == 0) {
+      vlog.debug("Ignoring clipboard provide with unsupported formats 0x"+
+                Integer.toHexString(flags));
+      return;
+    }
+
+    String text = new String(data[0], java.nio.charset.StandardCharsets.UTF_8);
+    // Strip a trailing null terminator, if present (see sendClipboardData()).
+    if (text.endsWith("\u0000"))
+      text = text.substring(0, text.length() - 1);
+    serverClipboard = convertLF(text);
+    hasRemoteClipboard = true;
+
+    handleClipboardData(serverClipboard);
+  }
+
+  private static String convertLF(String s)
+  {
+    return s.replace("\r\n", "\n").replace("\r", "\n");
+  }
+
+  private static String convertCRLF(String s)
+  {
+    return convertLF(s).replace("\n", "\r\n");
   }
 
   // Methods to initialise the connection
@@ -72,6 +254,8 @@ abstract public class CConnection extends CMsgHandler {
   {
     is = is_;
     os = os_;
+    if (decoder == null)
+      decoder = new DecodeManager(this);
   }
 
   // setShared sets the value of the shared flag which will be sent to the
@@ -104,8 +288,10 @@ abstract public class CConnection extends CMsgHandler {
       rect.setXYWH(0, 0,
                    Math.min(fb.width(), framebuffer.width()),
                    Math.min(fb.height(), framebuffer.height()));
-      data = framebuffer.getBuffer(rect);
-      fb.imageRect(framebuffer.getPF(), rect, data);
+      if (!rect.is_empty()) {
+        data = framebuffer.getBuffer(rect);
+        fb.imageRect(framebuffer.getPF(), rect, data);
+      }
 
       // Black out any new areas
 
@@ -133,20 +319,21 @@ abstract public class CConnection extends CMsgHandler {
   public final void initialiseProtocol()
   {
     state_ = stateEnum.RFBSTATE_PROTOCOL_VERSION;
+    csecurity = null;
   }
 
   // processMsg() should be called whenever there is data to read on the
   // InStream.  You must have called initialiseProtocol() first.
-  public void processMsg()
+  public boolean processMsg()
   {
     switch (state_) {
 
-    case RFBSTATE_PROTOCOL_VERSION: processVersionMsg();        break;
-    case RFBSTATE_SECURITY_TYPES:   processSecurityTypesMsg();  break;
-    case RFBSTATE_SECURITY:         processSecurityMsg();       break;
-    case RFBSTATE_SECURITY_RESULT:  processSecurityResultMsg(); break;
-    case RFBSTATE_INITIALISATION:   processInitMsg();           break;
-    case RFBSTATE_NORMAL:           reader_.readMsg();          break;
+    case RFBSTATE_PROTOCOL_VERSION: return processVersionMsg();
+    case RFBSTATE_SECURITY_TYPES:   return processSecurityTypesMsg();
+    case RFBSTATE_SECURITY:         return processSecurityMsg();
+    case RFBSTATE_SECURITY_RESULT:  return processSecurityResultMsg();
+    case RFBSTATE_INITIALISATION:   return processInitMsg();
+    case RFBSTATE_NORMAL:           return reader_.readMsg();
     case RFBSTATE_UNINITIALISED:
       throw new Exception("CConnection.processMsg: not initialised yet?");
     default:
@@ -154,7 +341,7 @@ abstract public class CConnection extends CMsgHandler {
     }
   }
 
-  private void processVersionMsg()
+  private boolean processVersionMsg()
   {
     ByteBuffer verStr = ByteBuffer.allocate(12);
     int majorVersion;
@@ -163,7 +350,7 @@ abstract public class CConnection extends CMsgHandler {
     vlog.debug("Reading protocol version");
 
     if (!is.checkNoWait(12))
-      return;
+      return false;
 
     is.readBytes(verStr, 12);
 
@@ -205,9 +392,10 @@ abstract public class CConnection extends CMsgHandler {
 
     vlog.info("Using RFB protocol version "+
               server.majorVersion+"."+server.minorVersion);
+    return true;
   }
 
-  private void processSecurityTypesMsg()
+  private boolean processSecurityTypesMsg()
   {
     vlog.debug("Processing security types message");
 
@@ -217,8 +405,7 @@ abstract public class CConnection extends CMsgHandler {
     secTypes = security.GetEnabledSecTypes();
 
     if (server.isVersion(3,3)) {
-
-      // legacy 3.3 server may only offer "vnc authentication" or "none"
+      if (!is.checkNoWait(4)) return false;
 
       secType = is.readU32();
       if (secType == Security.secTypeInvalid) {
@@ -243,11 +430,16 @@ abstract public class CConnection extends CMsgHandler {
 
     } else {
 
-      // 3.7 server will offer us a list
-
+      if (!is.checkNoWait(1)) return false;
+      is.setRestorePoint();
       int nServerSecTypes = is.readU8();
-      if (nServerSecTypes == 0)
+      if (nServerSecTypes == 0) {
+        is.clearRestorePoint();
         throwConnFailedException();
+      }
+
+      if (!is.hasDataOrRestore(nServerSecTypes)) return false;
+      is.clearRestorePoint();
 
       Iterator<Integer> j;
 
@@ -256,10 +448,6 @@ abstract public class CConnection extends CMsgHandler {
         vlog.debug("Server offers security type "+
                    Security.secTypeName(serverSecType)+"("+serverSecType+")");
 
-        /*
-        * Use the first type sent by server which matches client's type.
-        * It means server's order specifies priority.
-        */
         if (secType == Security.secTypeInvalid) {
           for (j = secTypes.iterator(); j.hasNext(); ) {
             int refType = (Integer)j.next();
@@ -288,30 +476,31 @@ abstract public class CConnection extends CMsgHandler {
 
     state_ = stateEnum.RFBSTATE_SECURITY;
     csecurity = security.GetCSecurity(secType);
-    processSecurityMsg();
+    return processSecurityMsg();
   }
 
-  private void processSecurityMsg() {
+  private boolean processSecurityMsg() {
     vlog.debug("Processing security message");
     if (csecurity.processMsg(this)) {
       state_ = stateEnum.RFBSTATE_SECURITY_RESULT;
-      processSecurityResultMsg();
+      return processSecurityResultMsg();
     }
+    return false;
   }
 
-  private void processSecurityResultMsg() {
+  private boolean processSecurityResultMsg() {
     vlog.debug("Processing security result message");
     int result;
     if (server.beforeVersion(3,8) && csecurity.getType() == Security.secTypeNone) {
       result = Security.secResultOK;
     } else {
-      if (!is.checkNoWait(1)) return;
+      if (!is.checkNoWait(4)) return false;
       result = is.readU32();
     }
     switch (result) {
     case Security.secResultOK:
       securityCompleted();
-      return;
+      return true;
     case Security.secResultFailed:
       vlog.debug("Auth failed");
       break;
@@ -328,9 +517,9 @@ abstract public class CConnection extends CMsgHandler {
     throw new AuthFailureException(reason);
   }
 
-  private void processInitMsg() {
+  private boolean processInitMsg() {
     vlog.debug("Reading server initialisation");
-    reader_.readServerInit();
+    return reader_.readServerInit();
   }
 
   private void throwConnFailedException() {
@@ -678,11 +867,17 @@ abstract public class CConnection extends CMsgHandler {
     }
     if (server.supportsClientRedirect)
       encodings.add(Encodings.pseudoEncodingClientRedirect);
+    if (server.supportsLEDState) {
+      encodings.add(Encodings.pseudoEncodingLEDState);
+      encodings.add(Encodings.pseudoEncodingVMwareLEDState);
+    }
 
     encodings.add(Encodings.pseudoEncodingDesktopName);
     encodings.add(Encodings.pseudoEncodingLastRect);
     encodings.add(Encodings.pseudoEncodingContinuousUpdates);
     encodings.add(Encodings.pseudoEncodingFence);
+    encodings.add(Encodings.pseudoEncodingQEMUKeyEvent);
+    encodings.add(Encodings.pseudoEncodingExtendedClipboard);
 
     if (Decoder.supported(preferredEncoding)) {
       encodings.add(preferredEncoding);
@@ -752,4 +947,9 @@ abstract public class CConnection extends CMsgHandler {
 
   protected ModifiablePixelBuffer framebuffer;
   private DecodeManager decoder;
+
+  private boolean hasLocalClipboard;
+  private boolean hasRemoteClipboard;
+  private boolean unsolicitedClipboardAttempt;
+  private String serverClipboard;
 }
