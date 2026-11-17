@@ -279,6 +279,18 @@ Time in milliseconds to rate-limit successive pointer events. Default is
 17 ms (60 Hz).
 .
 .TP
+.B \-Proxy \fIurl\fP
+Use the specified SOCKS5 proxy for outgoing connections. The URL must use
+the \fBsocks5://\fP or \fBsocks5h://\fP scheme and may include optional
+credentials, e.g. \fBsocks5://localhost:8383\fP or
+\fBsocks5://user:pass@proxy.example:1080\fP. If \fB\-Proxy\fP is not set,
+vncviewer also checks \fIhttp_proxy\fP and \fIhttps_proxy\fP (and their
+uppercase variants) and uses the first SOCKS5 URL it finds.
+Both schemes resolve destination hostnames through the proxy. The default
+proxy port is 1080. Credentials may use percent-encoding. The proxy is
+ignored when \fB\-via\fP is used to create an SSH tunnel.
+.
+.TP
 .B \-PreferredEncoding \fIencoding\fP
 This option specifies the preferred encoding to use from one of "Tight",
 "JPEG", "ZRLE", "Hextile", "H.264", or "Raw".

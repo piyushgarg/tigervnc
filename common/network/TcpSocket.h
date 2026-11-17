@@ -57,7 +57,7 @@ namespace network {
   class TcpSocket : public Socket {
   public:
     TcpSocket(int sock);
-    TcpSocket(const char *name, int port);
+    TcpSocket(const char *name, int port, const char *proxy=nullptr);
 
     const char* getPeerAddress() override;
     const char* getPeerEndpoint() override;

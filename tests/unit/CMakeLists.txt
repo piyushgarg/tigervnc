@@ -28,6 +28,10 @@ add_executable(hostport hostport.cxx)
 target_link_libraries(hostport network GTest::gtest_main)
 gtest_discover_tests(hostport)
 
+add_executable(proxysocket proxysocket.cxx)
+target_link_libraries(proxysocket network GTest::gtest_main)
+gtest_discover_tests(proxysocket)
+
 add_executable(parameters parameters.cxx)
 target_link_libraries(parameters core GTest::gtest_main)
 gtest_discover_tests(parameters)

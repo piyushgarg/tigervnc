@@ -41,6 +41,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <vector>
+
 #include <core/Configuration.h>
 #include <core/Exception.h>
 #include <core/LogWriter.h>
@@ -200,6 +202,484 @@ int network::getSockPort(int sock)
   }
 }
 
+namespace {
+
+  struct ProxyInfo {
+    std::string host;
+    int port;
+    std::string username;
+    std::string password;
+  };
+
+  static std::string trimString(const char *value)
+  {
+    const char *start;
+    const char *end;
+
+    if (value == nullptr)
+      return "";
+
+    start = value;
+    while ((*start != '\0') && isspace((unsigned char)*start))
+      start++;
+
+    end = start + strlen(start);
+    while ((end > start) && isspace((unsigned char)end[-1]))
+      end--;
+
+    return std::string(start, end - start);
+  }
+
+  static int hexValue(char c)
+  {
+    if ((c >= '0') && (c <= '9'))
+      return c - '0';
+    c = tolower((unsigned char)c);
+    if ((c >= 'a') && (c <= 'f'))
+      return c - 'a' + 10;
+    return -1;
+  }
+
+  static std::string percentDecode(const std::string& value)
+  {
+    std::string decoded;
+
+    decoded.reserve(value.length());
+
+    for (size_t i = 0;i < value.length();i++) {
+      if (value[i] != '%') {
+        decoded += value[i];
+        continue;
+      }
+
+      if ((i + 2) >= value.length())
+        throw std::invalid_argument("Invalid percent-encoding in proxy URL");
+
+      int upper = hexValue(value[i + 1]);
+      int lower = hexValue(value[i + 2]);
+      if ((upper < 0) || (lower < 0))
+        throw std::invalid_argument("Invalid percent-encoding in proxy URL");
+
+      decoded += (char)((upper << 4) | lower);
+      i += 2;
+    }
+
+    return decoded;
+  }
+
+  static int parsePort(const std::string& value, int defaultPort)
+  {
+    char *end;
+    long port;
+
+    if (value.empty())
+      return defaultPort;
+
+    port = strtol(value.c_str(), &end, 10);
+    if ((*end != '\0') || (port < 1) || (port > 65535))
+      throw std::invalid_argument("Invalid proxy port");
+
+    return (int)port;
+  }
+
+  static ProxyInfo parseProxy(const char *proxy)
+  {
+    ProxyInfo info;
+    std::string url;
+    std::string scheme;
+    std::string authority;
+    std::string hostPort;
+    std::string portString;
+    size_t schemeEnd;
+    size_t authorityEnd;
+    size_t at;
+
+    url = trimString(proxy);
+    if (url.empty())
+      throw std::invalid_argument("Empty proxy URL");
+
+    schemeEnd = url.find("://");
+    if (schemeEnd == std::string::npos)
+      throw std::invalid_argument("Proxy URL is missing a scheme");
+
+    scheme = url.substr(0, schemeEnd);
+    for (size_t i = 0;i < scheme.length();i++)
+      scheme[i] = tolower((unsigned char)scheme[i]);
+
+    if ((scheme != "socks5") && (scheme != "socks5h"))
+      throw std::invalid_argument(core::format("Unsupported proxy URL scheme \"%s\"",
+                                               scheme.c_str()));
+
+    authorityEnd = url.find_first_of("/?#", schemeEnd + 3);
+    authority = url.substr(schemeEnd + 3,
+                           authorityEnd == std::string::npos ?
+                             authorityEnd : authorityEnd - (schemeEnd + 3));
+    if (authority.empty())
+      throw std::invalid_argument("Proxy URL is missing a host");
+
+    if (authorityEnd != std::string::npos) {
+      std::string suffix = url.substr(authorityEnd);
+
+      if (suffix != "/")
+        throw std::invalid_argument("Proxy URL must not contain a path, query, or fragment");
+    }
+
+    at = authority.rfind('@');
+    if (at != std::string::npos) {
+      std::string userinfo = authority.substr(0, at);
+      size_t colon;
+
+      hostPort = authority.substr(at + 1);
+      colon = userinfo.find(':');
+      if (colon == std::string::npos) {
+        info.username = percentDecode(userinfo);
+      } else {
+        info.username = percentDecode(userinfo.substr(0, colon));
+        info.password = percentDecode(userinfo.substr(colon + 1));
+      }
+    } else {
+      hostPort = authority;
+    }
+
+    if (hostPort.empty())
+      throw std::invalid_argument("Proxy URL is missing a host");
+
+    if (hostPort[0] == '[') {
+      size_t bracketEnd;
+
+      bracketEnd = hostPort.find(']');
+      if (bracketEnd == std::string::npos)
+        throw std::invalid_argument("Unmatched [ in proxy host");
+
+      info.host = hostPort.substr(1, bracketEnd - 1);
+      if ((bracketEnd + 1) < hostPort.length()) {
+        if (hostPort[bracketEnd + 1] != ':')
+          throw std::invalid_argument("Invalid proxy URL");
+        portString = hostPort.substr(bracketEnd + 2);
+      }
+    } else {
+      size_t colon = hostPort.rfind(':');
+
+      if (colon == std::string::npos) {
+        info.host = hostPort;
+      } else {
+        if (hostPort.find(':') != colon)
+          throw std::invalid_argument("IPv6 proxy addresses must be enclosed in []");
+        info.host = hostPort.substr(0, colon);
+        portString = hostPort.substr(colon + 1);
+      }
+    }
+
+    if (info.host.empty())
+      throw std::invalid_argument("Proxy URL is missing a host");
+
+    info.port = parsePort(portString, 1080);
+
+    if ((info.username.length() > 255) || (info.password.length() > 255))
+      throw std::invalid_argument("SOCKS5 proxy credentials are too long");
+
+    return info;
+  }
+
+  static int connectTcpHost(const char *host, int port)
+  {
+    int sock;
+    int err;
+    int result;
+    struct addrinfo *ai;
+    struct addrinfo *current;
+    struct addrinfo hints;
+
+    memset(&hints, 0, sizeof(struct addrinfo));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_canonname = nullptr;
+    hints.ai_addr = nullptr;
+    hints.ai_next = nullptr;
+
+    result = getaddrinfo(host, nullptr, &hints, &ai);
+    if (result != 0)
+      throw core::getaddrinfo_error("Unable to resolve host by name", result);
+
+    sock = -1;
+    err = 0;
+    for (current = ai; current != nullptr; current = current->ai_next) {
+      int family;
+      vnc_sockaddr_t sa;
+      socklen_t salen;
+      char ntop[NI_MAXHOST];
+
+      family = current->ai_family;
+
+      switch (family) {
+      case AF_INET:
+        if (!UseIPv4)
+          continue;
+        break;
+      case AF_INET6:
+        if (!UseIPv6)
+          continue;
+        break;
+      default:
+        continue;
+      }
+
+      salen = current->ai_addrlen;
+      memcpy(&sa, current->ai_addr, salen);
+
+      if (family == AF_INET)
+        sa.u.sin.sin_port = htons(port);
+      else
+        sa.u.sin6.sin6_port = htons(port);
+
+      getnameinfo(&sa.u.sa, salen, ntop, sizeof(ntop), nullptr, 0,
+                  NI_NUMERICHOST);
+      vlog.debug("Connecting to %s [%s] port %d", host, ntop, port);
+
+      sock = socket(family, SOCK_STREAM, 0);
+      if (sock == -1) {
+        err = errorNumber;
+        freeaddrinfo(ai);
+        throw core::socket_error("Unable to create socket", err);
+      }
+
+      while ((result = connect(sock, &sa.u.sa, salen)) == -1) {
+        err = errorNumber;
+#ifndef WIN32
+        if (err == EINTR)
+          continue;
+#endif
+        vlog.debug("Failed to connect to address %s port %d: %d",
+                   ntop, port, err);
+        closesocket(sock);
+        sock = -1;
+        break;
+      }
+
+      if (result == 0)
+        break;
+    }
+
+    freeaddrinfo(ai);
+
+    if (sock == -1) {
+      if (err == 0)
+        throw std::runtime_error("No useful address for host");
+      throw core::socket_error("Unable to connect to socket", err);
+    }
+
+    return sock;
+  }
+
+  static void writeExact(int sock, const uint8_t *data, size_t length)
+  {
+    while (length > 0) {
+      int ret;
+
+#ifdef WIN32
+      ret = send(sock, (const char*)data, (int)length, 0);
+#else
+      ret = send(sock, data, length, 0);
+#endif
+      if (ret == -1) {
+        int err = errorNumber;
+
+#ifndef WIN32
+        if (err == EINTR)
+          continue;
+#endif
+        throw core::socket_error("Unable to write to socket", err);
+      }
+      if (ret == 0)
+        throw std::runtime_error("Unexpected EOF when writing to socket");
+
+      data += ret;
+      length -= ret;
+    }
+  }
+
+  static void readExact(int sock, uint8_t *data, size_t length)
+  {
+    while (length > 0) {
+      int ret;
+
+#ifdef WIN32
+      ret = recv(sock, (char*)data, (int)length, 0);
+#else
+      ret = recv(sock, data, length, 0);
+#endif
+      if (ret == -1) {
+        int err = errorNumber;
+
+#ifndef WIN32
+        if (err == EINTR)
+          continue;
+#endif
+        throw core::socket_error("Unable to read from socket", err);
+      }
+      if (ret == 0)
+        throw std::runtime_error("Unexpected EOF when reading from socket");
+
+      data += ret;
+      length -= ret;
+    }
+  }
+
+  static void appendSocks5Destination(std::vector<uint8_t> *request,
+                                      const char *host, int port)
+  {
+    struct in_addr ipv4;
+    struct in6_addr ipv6;
+    size_t hostLength;
+
+    if ((port < 1) || (port > 65535))
+      throw std::invalid_argument("Invalid target port for SOCKS5 proxy");
+
+    if (inet_pton(AF_INET, host, &ipv4) == 1) {
+      request->push_back(0x01);
+      const uint8_t *addr = (const uint8_t*)&ipv4;
+      request->insert(request->end(), addr, addr + 4);
+    } else if (inet_pton(AF_INET6, host, &ipv6) == 1) {
+      request->push_back(0x04);
+      const uint8_t *addr = (const uint8_t*)&ipv6;
+      request->insert(request->end(), addr, addr + 16);
+    } else {
+      hostLength = strlen(host);
+      if ((hostLength == 0) || (hostLength > 255))
+        throw std::invalid_argument("Invalid target host for SOCKS5 proxy");
+
+      request->push_back(0x03);
+      request->push_back((uint8_t)hostLength);
+      request->insert(request->end(), host, host + hostLength);
+    }
+
+    request->push_back((uint8_t)(port >> 8));
+    request->push_back((uint8_t)(port & 0xff));
+  }
+
+  static const char *socks5ReplyString(uint8_t reply)
+  {
+    switch (reply) {
+    case 0x01:
+      return "general SOCKS server failure";
+    case 0x02:
+      return "connection not allowed by ruleset";
+    case 0x03:
+      return "network unreachable";
+    case 0x04:
+      return "host unreachable";
+    case 0x05:
+      return "connection refused";
+    case 0x06:
+      return "TTL expired";
+    case 0x07:
+      return "command not supported";
+    case 0x08:
+      return "address type not supported";
+    default:
+      return "unknown error";
+    }
+  }
+
+  static void discardSocks5Address(int sock, uint8_t atyp)
+  {
+    size_t length;
+    uint8_t size;
+
+    switch (atyp) {
+    case 0x01:
+      length = 4;
+      break;
+    case 0x04:
+      length = 16;
+      break;
+    case 0x03:
+      readExact(sock, &size, 1);
+      length = size;
+      break;
+    default:
+      throw std::runtime_error("SOCKS5 proxy returned an unknown address type");
+    }
+
+    std::vector<uint8_t> discard(length + 2);
+    if (!discard.empty())
+      readExact(sock, discard.data(), discard.size());
+  }
+
+  static void connectViaSocks5(int sock, const ProxyInfo& proxy,
+                               const char *host, int port)
+  {
+    std::vector<uint8_t> message;
+    uint8_t response[4];
+
+    message.push_back(0x05);
+    if (proxy.username.empty() && proxy.password.empty()) {
+      message.push_back(0x01);
+      message.push_back(0x00);
+    } else {
+      message.push_back(0x02);
+      message.push_back(0x00);
+      message.push_back(0x02);
+    }
+
+    writeExact(sock, message.data(), message.size());
+    readExact(sock, response, 2);
+
+    if (response[0] != 0x05)
+      throw std::runtime_error("SOCKS5 proxy returned an invalid version");
+
+    if (response[1] == 0xff)
+      throw std::runtime_error("SOCKS5 proxy rejected all authentication methods");
+
+    if (response[1] == 0x02) {
+      if (proxy.username.empty() && proxy.password.empty())
+        throw std::runtime_error("SOCKS5 proxy selected an authentication method that was not offered");
+
+      message.clear();
+      message.push_back(0x01);
+      message.push_back((uint8_t)proxy.username.length());
+      message.insert(message.end(),
+                     proxy.username.begin(), proxy.username.end());
+      message.push_back((uint8_t)proxy.password.length());
+      message.insert(message.end(),
+                     proxy.password.begin(), proxy.password.end());
+
+      writeExact(sock, message.data(), message.size());
+      readExact(sock, response, 2);
+
+      if (response[0] != 0x01)
+        throw std::runtime_error("SOCKS5 proxy returned an invalid authentication version");
+      if (response[1] != 0x00)
+        throw std::runtime_error("SOCKS5 proxy authentication failed");
+    } else if (response[1] != 0x00) {
+      throw std::runtime_error(core::format(
+        "SOCKS5 proxy requested unsupported authentication method %u",
+        response[1]));
+    }
+
+    message.clear();
+    message.push_back(0x05);
+    message.push_back(0x01);
+    message.push_back(0x00);
+    appendSocks5Destination(&message, host, port);
+
+    writeExact(sock, message.data(), message.size());
+    readExact(sock, response, 4);
+
+    if (response[0] != 0x05)
+      throw std::runtime_error("SOCKS5 proxy returned an invalid version");
+    if (response[2] != 0x00)
+      throw std::runtime_error("SOCKS5 proxy returned an invalid response");
+    if (response[1] != 0x00) {
+      throw std::runtime_error(core::format("SOCKS5 proxy connect failed: %s",
+                                            socks5ReplyString(response[1])));
+    }
+
+    discardSocks5Address(sock, response[3]);
+  }
+
+}
+
 // -=- TcpSocket
 
 TcpSocket::TcpSocket(int sock) : Socket(sock)
@@ -208,94 +688,30 @@ TcpSocket::TcpSocket(int sock) : Socket(sock)
   enableNagles(false);
 }
 
-TcpSocket::TcpSocket(const char *host, int port)
+TcpSocket::TcpSocket(const char *host, int port, const char *proxy)
 {
-  int sock, err, result;
-  struct addrinfo *ai, *current, hints;
+  int sock = -1;
 
-  // - Create a socket
+  try {
+    if ((proxy != nullptr) && (*proxy != '\0')) {
+      ProxyInfo proxyInfo = parseProxy(proxy);
 
-  memset(&hints, 0, sizeof(struct addrinfo));
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  hints.ai_canonname = nullptr;
-  hints.ai_addr = nullptr;
-  hints.ai_next = nullptr;
+      vlog.debug("Connecting to %s port %d via SOCKS5 proxy %s port %d",
+                 host, port, proxyInfo.host.c_str(), proxyInfo.port);
 
-  if ((result = getaddrinfo(host, nullptr, &hints, &ai)) != 0) {
-    throw core::getaddrinfo_error("Unable to resolve host by name", result);
-  }
-
-  sock = -1;
-  err = 0;
-  for (current = ai; current != nullptr; current = current->ai_next) {
-    int family;
-    vnc_sockaddr_t sa;
-    socklen_t salen;
-    char ntop[NI_MAXHOST];
-
-    family = current->ai_family;
-
-    switch (family) {
-    case AF_INET:
-      if (!UseIPv4)
-        continue;
-      break;
-    case AF_INET6:
-      if (!UseIPv6)
-        continue;
-      break;
-    default:
-      continue;
+      sock = connectTcpHost(proxyInfo.host.c_str(), proxyInfo.port);
+      connectViaSocks5(sock, proxyInfo, host, port);
+    } else {
+      sock = connectTcpHost(host, port);
     }
 
-    salen = current->ai_addrlen;
-    memcpy(&sa, current->ai_addr, salen);
-
-    if (family == AF_INET)
-      sa.u.sin.sin_port = htons(port);
-    else
-      sa.u.sin6.sin6_port = htons(port);
-
-    getnameinfo(&sa.u.sa, salen, ntop, sizeof(ntop), nullptr, 0, NI_NUMERICHOST);
-    vlog.debug("Connecting to %s [%s] port %d", host, ntop, port);
-
-    sock = socket (family, SOCK_STREAM, 0);
-    if (sock == -1) {
-      err = errorNumber;
-      freeaddrinfo(ai);
-      throw core::socket_error("Unable to create socket", err);
-    }
-
-  /* Attempt to connect to the remote host */
-    while ((result = connect(sock, &sa.u.sa, salen)) == -1) {
-      err = errorNumber;
-#ifndef WIN32
-      if (err == EINTR)
-        continue;
-#endif
-      vlog.debug("Failed to connect to address %s port %d: %d",
-                 ntop, port, err);
+    setFd(sock);
+    sock = -1;
+  } catch (...) {
+    if (sock != -1)
       closesocket(sock);
-      sock = -1;
-      break;
-    }
-
-    if (result == 0)
-      break;
+    throw;
   }
-
-  freeaddrinfo(ai);
-
-  if (sock == -1) {
-    if (err == 0)
-      throw std::runtime_error("No useful address for host");
-    else
-      throw core::socket_error("Unable to connect to socket", err);
-  }
-
-  // Take proper ownership of the socket
-  setFd(sock);
 
   // Disable Nagle's algorithm, to reduce latency
   enableNagles(false);

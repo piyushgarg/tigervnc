@@ -89,6 +89,13 @@ core::BoolParameter
                    "Give a dialog on connection problems rather than "
                    "exiting immediately and ask for a reconnect.",
                    true);
+core::StringParameter
+  proxyURL("Proxy",
+           "SOCKS5 proxy URL for outgoing connections, e.g. "
+           "socks5://host[:port] or "
+           "socks5://user:pass@host[:port]. When unset, a SOCKS5 "
+           "URL in http_proxy or https_proxy will also be used.",
+           "");
 
 core::StringParameter
   passwordFile("PasswordFile",
@@ -245,8 +252,8 @@ core::StringParameter
 static const char* IDENTIFIER_STRING = "TigerVNC Configuration file Version 1.0";
 
 /*
- * We only save the sub set of parameters that can be modified from
- * the graphical user interface
+ * We only save the subset of parameters that are useful to persist in
+ * viewer configuration files.
  */
 static core::VoidParameter* parameterArray[] = {
   /* Security */
@@ -257,6 +264,7 @@ static core::VoidParameter* parameterArray[] = {
   &rfb::SecurityClient::secTypes,
   /* Misc. */
   &reconnectOnError,
+  &proxyURL,
   &shared,
   /* Compression */
   &autoSelect,

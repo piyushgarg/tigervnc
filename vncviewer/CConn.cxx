@@ -23,6 +23,9 @@
 #endif
 
 #include <assert.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -90,6 +93,69 @@ static const rfb::PixelFormat mediumColourPF(8, 8, false, true,
 
 // Time new bandwidth estimates are weighted against (in ms)
 static const unsigned bpsEstimateWindow = 1000;
+
+static bool hasPrefixIgnoreCase(const char *value, const char *prefix)
+{
+  while (*prefix != '\0') {
+    if (*value == '\0')
+      return false;
+    if (tolower((unsigned char)*value) != tolower((unsigned char)*prefix))
+      return false;
+    value++;
+    prefix++;
+  }
+
+  return true;
+}
+
+static bool isSocks5ProxyURL(const char *url)
+{
+  if (url == nullptr)
+    return false;
+
+  while ((*url != '\0') && isspace((unsigned char)*url))
+    url++;
+
+  return hasPrefixIgnoreCase(url, "socks5://") ||
+         hasPrefixIgnoreCase(url, "socks5h://");
+}
+
+static std::string getProxySetting()
+{
+#ifndef WIN32
+  if (strlen(via) > 0) {
+    if (strlen(proxyURL) > 0)
+      vlog.info(_("Ignoring Proxy parameter because -via uses an SSH tunnel"));
+    return "";
+  }
+#endif
+
+  if (strlen(proxyURL) > 0)
+    return proxyURL.getValueStr();
+
+  const char *envvars[] = {
+    "http_proxy", "HTTP_PROXY",
+    "https_proxy", "HTTPS_PROXY",
+  };
+
+  for (const char *envvar : envvars) {
+    const char *value;
+
+    value = getenv(envvar);
+    if ((value == nullptr) || (*value == '\0'))
+      continue;
+
+    if (!isSocks5ProxyURL(value)) {
+      vlog.debug("Ignoring %s with unsupported proxy URL scheme", envvar);
+      continue;
+    }
+
+    vlog.debug("Using SOCKS5 proxy from %s", envvar);
+    return value;
+  }
+
+  return "";
+}
 
 CConn::CConn()
   : serverPort(0), sock(nullptr),
@@ -163,6 +229,8 @@ CConn::~CConn()
 
 void CConn::connect(const char* vncServerName, network::Socket* socket)
 {
+  std::string proxy;
+
   sock = socket;
   if(sock == nullptr) {
     try {
@@ -175,8 +243,14 @@ void CConn::connect(const char* vncServerName, network::Socket* socket)
 #endif
       {
         network::getHostAndPort(vncServerName, &serverHost, &serverPort);
+        proxy = getProxySetting();
 
-        sock = new network::TcpSocket(serverHost.c_str(), serverPort);
+        sock = new network::TcpSocket(serverHost.c_str(), serverPort,
+                                      proxy.empty() ? nullptr : proxy.c_str());
+        if (!proxy.empty()) {
+          fprintf(stdout, "%s\n", _("Connected via proxy"));
+          fflush(stdout);
+        }
         vlog.info(_("Connected to host %s port %d"),
                   serverHost.c_str(), serverPort);
       }
